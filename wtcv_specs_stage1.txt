@@ -1,0 +1,147 @@
+Project Reboot Specs (Training + Evaluation + Single-Image Inference)
+
+1) Code Assets
+
+Training script: train_stage1_seg.py
+Evaluation script: eval_stage1_seg.py
+Single-image tiled inference notebook: record_pairs_single_image_tiled_inference.ipynb
+2) Data Contract
+
+Input format: LabelMe-style image/json pairs in one folder.
+Supported image extensions in training loader: .png, .jpg, .jpeg, .gif, .tif, .tiff.
+JSON requirements:
+imageWidth, imageHeight
+shapes list with label, points, optional shape_type
+Label filtering is strict via --label-name (examples: vehicle, Tank, enemy).
+For shape_type=rectangle, 2 points are accepted.
+For polygons, minimum points are controlled by --min-poly-points.
+3) Training Pipeline (train_stage1_seg.py)
+
+Split:
+Record-level split: 95% train / 5% val after deterministic shuffle by seed.
+Tile generation:
+Tiling with tile_size and tile_stride (default 224 / 112).
+A tile is positive only if object bbox is fully inside tile bounds.
+Segmentation target:
+Built from bbox rectangles (not polygon raster) for tile objects.
+Downsampled with max-pooling to seg_out_stride grid (default stride 4).
+Dataset balancing:
+If --balance-train-50-50: equal positive/negative tiles are sampled.
+If --balance-val-50-50: same logic for val tiles.
+Subset behavior:
+--subset-size is applied after balancing and shuffle.
+Effective subset is capped by available tiles.
+Training loop:
+MCC loss only (mcc_loss_with_logits).
+Training metric: mask IoU at threshold (--iou-threshold, default 0.5).
+Validation runs every --val-interval epochs.
+Example images are logged every --image-log-interval.
+Freeze policy:
+DINO backbone frozen.
+ResNet local branch frozen.
+Trainable modules: dino_up, fuse_1x1, head.
+4) Model Architecture (Stage 1)
+
+DINO branch:
+dinov2_vits14 patch tokens from forward_features()["x_norm_patchtokens"].
+Projected by 1x1 conv to fusion_channels (default 256).
+Learned upsampler:
+2 blocks of upsample + conv + GELU, then size-align to local feature map.
+Local branch:
+ResNet18 truncated to stem + layer1 (raw 64-channel low-level features).
+Fusion:
+Concatenate [upscaled_dino, resnet_l1].
+Single 1x1 fusion conv to fusion_channels.
+Segmentation head:
+1x1 conv outputing 1 channel logits.
+Final output resized to (input_h/4, input_w/4).
+5) Training Outputs
+
+Run directory: runs/<YYYYmmdd-HHMMSS>-<run_name>/
+Artifacts:
+config.json
+hparams.yaml
+history.json
+TensorBoard logs (same run folder)
+Checkpoints:
+best_val_iou.pt (only updated on validation epochs)
+final.pt
+6) Training CLI (key args)
+
+Data/labels: --data-dir, --label-name, --min-poly-points
+Tiling: --tile-size, --tile-stride, --seg-out-stride
+Optimization: --epochs, --batch-size, --lr, --weight-decay
+Sampling: --balance-train-50-50, --balance-val-50-50, --subset-size
+Validation/logging: --val-interval, --image-log-interval, --iou-threshold
+Infra: --num-workers, --trust-torch-hub-repo
+7) Evaluation Pipeline (eval_stage1_seg.py)
+
+Loads the same Stage1SegNet and checkpoint.
+Checkpoint loading:
+Tries torch.load(..., weights_only=True).
+Falls back to weights_only=False with warning (needed for checkpoints containing non-safe globals like PosixPath in cfg).
+Inference method:
+Full-image tiled inference.
+Tile probabilities are merged on low-res grid by overlap averaging.
+Thresholding to binary mask (--pred-threshold, default 0.5).
+Predicted instances:
+Connected components on binary predicted low-res map.
+GT instances:
+Rasterized from polygons (not bbox) to masks.
+Evaluation metrics:
+semantic_iou_mean_per_image
+semantic_iou_global
+mAP_50_95, mAP_50, mAP_75
+mAP_small, mAP_medium, mAP_large (COCO-like area buckets)
+Speed:
+Uses DataLoader with --num-workers (default 8), batch size 1 full-image samples.
+8) Evaluation CLI (key args)
+
+--data-dir
+--checkpoint
+--label-name
+--tile-size, --tile-stride, --seg-out-stride
+--pred-threshold
+--num-workers
+9) Single-Image Tiled Inference Notebook
+
+File: record_pairs_single_image_tiled_inference.ipynb
+Purpose:
+Pick one record_pairs image.
+Run tiled inference with checkpoint.
+Merge back to original image size.
+Show:
+Original image + GT bboxes
+Prediction heatmap overlay
+Pred mask overlay + predicted bboxes + GT bboxes
+Configurable cells:
+DATA_DIR
+CHECKPOINT
+LABEL_NAME
+IMAGE_PATH (optional explicit image; if None, first record is used)
+TILE_SIZE, TILE_STRIDE, SEG_OUT_STRIDE, PRED_THRESHOLD
+10) Known Implementation Notes
+
+Positive tile criterion is strict: bbox must be fully inside tile.
+Training mask target is bbox-derived, not polygon-derived.
+--subset-size help text says “records (images)” but implementation applies it to train tiles after balancing.
+If no positive train tiles exist for current label, training hard-fails and prints discovered labels.
+11) Reboot Quickstart Commands
+
+Train example:
+python train_stage1_seg.py \
+  --data-dir /home/schelli/git/wtcv/data/record_pairs \
+  --label-name vehicle \
+  --balance-train-50-50 \
+  --balance-val-50-50 \
+  --subset-size 10000 \
+  --epochs 10 \
+  --val-interval 3 \
+  --run-name stage1_reboot
+Eval example:
+python eval_stage1_seg.py \
+  --data-dir /home/schelli/git/wtcv/data/record_pairs \
+  --checkpoint /home/schelli/git/wtcv/runs/<run>/checkpoints/final.pt \
+  --label-name vehicle
+Notebook:
+Open record_pairs_single_image_tiled_inference.ipynb, set config cell, run all cells.
