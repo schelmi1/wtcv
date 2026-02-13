@@ -294,7 +294,6 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = Stage1SegNet(channels=cfg.fusion_channels, trust_repo=cfg.trust_torch_hub_repo).to(device)
     try:
         ckpt = torch.load(cfg.checkpoint, map_location=device, weights_only=True)
     except Exception as e:
@@ -304,6 +303,24 @@ def main() -> None:
             f"Original error: {e}"
         )
         ckpt = torch.load(cfg.checkpoint, map_location=device, weights_only=False)
+
+    ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
+    model_channels = int(ckpt_cfg.get("fusion_channels", cfg.fusion_channels))
+    dino_upsampler_type = str(ckpt_cfg.get("dino_upsampler_type", "learned"))
+    anyup_q_chunk_size = int(ckpt_cfg.get("anyup_q_chunk_size", 256))
+    head_type = str(ckpt_cfg.get("head_type", "pointwise"))
+    use_tile_cls_head = bool(ckpt_cfg.get("use_tile_cls_head", False))
+    use_zoom_cls_head = bool(ckpt_cfg.get("use_zoom_cls_head", False))
+
+    model = Stage1SegNet(
+        channels=model_channels,
+        trust_repo=cfg.trust_torch_hub_repo,
+        dino_upsampler_type=dino_upsampler_type,
+        anyup_q_chunk_size=anyup_q_chunk_size,
+        head_type=head_type,
+        use_tile_cls_head=use_tile_cls_head,
+        use_zoom_cls_head=use_zoom_cls_head,
+    ).to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
     model.eval()

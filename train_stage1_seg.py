@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import json
 import math
 import random
+import time
 from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,7 +16,7 @@ from PIL import Image, ImageDraw
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 import torchvision
@@ -32,9 +34,11 @@ class Cfg:
     data_dir: Path
     output_dir: Path
     run_name: str
+    resume_checkpoint: Optional[Path] = None
 
     tile_size: int = 224
     tile_stride: int = 112
+    tile_scales: str = "1.0"
 
     label_name: str = "vehicle"
     min_poly_points: int = 3
@@ -42,27 +46,43 @@ class Cfg:
     seg_out_stride: int = 4
 
     batch_size: int = 8
-    num_workers: int = 2
+    num_workers: int = 8
+    dataloader_verbose: bool = True
     epochs: int = 5
-    lr: float = 2e-4
+    lr: float = 1e-4
+    lr_scheduler: str = "cosine"  # none | cosine
+    lr_min: float = 1e-5
     weight_decay: float = 1e-4
 
     fusion_channels: int = 256
     dino_upsampler_type: str = "learned"  # learned | anyup
     anyup_q_chunk_size: int = 256
+    head_type: str = "pointwise"  # pointwise | dwsep | residual
+    use_tile_cls_head: bool = True
+    tile_cls_weight: float = 0.3
+    use_zoom_cls_head: bool = True
+    zoom_cls_weight: float = 0.2
 
     balance_train_50_50: bool = True
-    balance_val_50_50: bool = False
+    balance_val_50_50: bool = True
+    augment_low_vis: bool = False
+    hard_negative_mining: bool = True
+    hnm_hard_ratio: float = 0.3
+    hnm_pool_frac: float = 0.2
 
     seed: int = 42
     subset_size: int = 0  # 0 means use all records
 
-    val_interval: int = 1
+    val_interval: int = 5
     train_example_items: int = 3
     val_example_items: int = 3
     image_log_interval: int = 1
 
     iou_threshold: float = 0.5
+    mcc_weight: float = 0.4
+    mcc_warmup_epochs: int = 3
+    bce_weight: float = 0.5
+    boundary_weight: float = 0.2
 
     trust_torch_hub_repo: bool = True
 
@@ -116,6 +136,7 @@ def polygon_center(points: List[List[float]]) -> Tuple[float, float]:
 
 def load_records(data_dir: Path, label_name: str, min_poly_points: int) -> List[Dict]:
     allowed_exts = (".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff")
+    wanted_label = str(label_name).strip().casefold()
     records = []
     for jf in sorted(data_dir.glob("*.json")):
         # Resolve image file by shared stem across common extensions.
@@ -137,7 +158,8 @@ def load_records(data_dir: Path, label_name: str, min_poly_points: int) -> List[
 
         objects = []
         for s in shapes:
-            if s.get("label") != label_name:
+            got_label = str(s.get("label", "")).strip().casefold()
+            if got_label != wanted_label:
                 continue
             pts = s.get("points") or []
             stype = str(s.get("shape_type", "")).lower()
@@ -149,12 +171,17 @@ def load_records(data_dir: Path, label_name: str, min_poly_points: int) -> List[
                     continue
             x0, y0, x1, y1 = polygon_bbox(pts)
             cx, cy = polygon_center(pts)
+            if stype == "rectangle":
+                pa = float(max(0.0, x1 - x0) * max(0.0, y1 - y0))
+            else:
+                pa = polygon_area(pts)
             objects.append(
                 {
                     "points": pts,
+                    "shape_type": stype if stype else "polygon",
                     "bbox_xyxy": [x0, y0, x1, y1],
                     "center_xy": [cx, cy],
-                    "poly_area": polygon_area(pts),
+                    "poly_area": pa,
                 }
             )
 
@@ -226,16 +253,23 @@ def objects_in_tile(objs: List[Dict], x0: int, y0: int, size: int) -> List[Dict]
         fully_within = (bx0 >= x0) and (by0 >= y0) and (bx1 <= x1) and (by1 <= y1)
         if not fully_within:
             continue
-        # Keep shifted bbox only (triplet pipeline uses bbox->mask).
+        # Keep shifted geometry in tile-local coordinates.
         sbx0 = float(max(0.0, min(size, bx0 - x0)))
         sby0 = float(max(0.0, min(size, by0 - y0)))
         sbx1 = float(max(0.0, min(size, bx1 - x0)))
         sby1 = float(max(0.0, min(size, by1 - y0)))
         if sbx1 <= sbx0 or sby1 <= sby0:
             continue
+        spts = []
+        for p in o.get("points", []):
+            px = float(max(0.0, min(size, float(p[0]) - x0)))
+            py = float(max(0.0, min(size, float(p[1]) - y0)))
+            spts.append([px, py])
         out.append(
             {
                 "bbox_xyxy": [sbx0, sby0, sbx1, sby1],
+                "points": spts,
+                "shape_type": o.get("shape_type", "polygon"),
                 "poly_area": o["poly_area"],
             }
         )
@@ -246,6 +280,10 @@ def build_seg_target(tile_size: int, objs: List[Dict], out_stride: int) -> np.nd
     full = Image.new("L", (tile_size, tile_size), 0)
     draw = ImageDraw.Draw(full)
     for o in objs:
+        pts = o.get("points", []) or []
+        if len(pts) >= 3:
+            draw.polygon(pts, fill=1)
+            continue
         bx0, by0, bx1, by1 = o.get("bbox_xyxy", [0, 0, 0, 0])
         if bx1 > bx0 and by1 > by0:
             draw.rectangle([bx0, by0, bx1, by1], fill=1)
@@ -263,17 +301,24 @@ class SegTileDataset(Dataset):
         self,
         records: List[Dict],
         tile_size: int,
-        stride: int,
+        tile_configs: List[Tuple[int, int]],
         seg_out_stride: int,
         seed: int,
         balance_50_50: bool,
+        augment_low_vis: bool = False,
+        is_train: bool = False,
         dataset_name: str = "dataset",
+        verbose: bool = False,
     ):
         self.records = records
         self.tile_size = tile_size
-        self.stride = stride
+        self.tile_configs = tile_configs
         self.seg_out_stride = seg_out_stride
         self.balance_50_50 = balance_50_50
+        self.augment_low_vis = augment_low_vis
+        self.is_train = is_train
+        self.verbose = verbose
+        self.seed = int(seed)
 
         # Triplets: (ridx, x0, y0, objs_in_tile, is_object)
         all_triplets = []
@@ -284,22 +329,24 @@ class SegTileDataset(Dataset):
             enumerate(records),
             total=len(records),
             desc=f"Building {dataset_name} tile index",
-            leave=False,
+            leave=verbose,
         ):
-            for x0, y0 in tile_origins(r["width"], r["height"], tile_size, stride):
-                objs = objects_in_tile(r["objects"], x0, y0, tile_size)
-                item = {
-                    "ridx": ridx,
-                    "x0": x0,
-                    "y0": y0,
-                    "objs": objs,
-                    "is_object": int(len(objs) > 0),
-                }
-                all_triplets.append(item)
-                if item["is_object"] == 1:
-                    obj_triplets.append(item)
-                else:
-                    non_obj_triplets.append(item)
+            for src_tile_size, src_stride in self.tile_configs:
+                for x0, y0 in tile_origins(r["width"], r["height"], src_tile_size, src_stride):
+                    objs = objects_in_tile(r["objects"], x0, y0, src_tile_size)
+                    item = {
+                        "ridx": ridx,
+                        "x0": x0,
+                        "y0": y0,
+                        "src_tile_size": src_tile_size,
+                        "objs": objs,
+                        "is_object": int(len(objs) > 0),
+                    }
+                    all_triplets.append(item)
+                    if item["is_object"] == 1:
+                        obj_triplets.append(item)
+                    else:
+                        non_obj_triplets.append(item)
 
         if balance_50_50 and len(obj_triplets) > 0 and len(non_obj_triplets) > 0:
             n = min(len(obj_triplets), len(non_obj_triplets))
@@ -314,25 +361,170 @@ class SegTileDataset(Dataset):
         # Dataset-level positive/negative index lists (relative to self.samples).
         self.pos_dataset_indices = [i for i, s in enumerate(self.samples) if s["is_object"] == 1]
         self.neg_dataset_indices = [i for i, s in enumerate(self.samples) if s["is_object"] == 0]
+        self.neg_hard_scores = np.zeros(len(self.samples), dtype=np.float32)
 
         self.normalize = torchvision.transforms.Normalize(
             mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
         )
+        if self.verbose:
+            print(
+                f"{dataset_name}_tiles built: total={len(self.samples)} "
+                f"pos={len(self.pos_dataset_indices)} neg={len(self.neg_dataset_indices)} "
+                f"(balanced={self.balance_50_50})"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def update_hard_negative_scores(self, score_by_index: Dict[int, float]) -> None:
+        for idx, score in score_by_index.items():
+            i = int(idx)
+            if i < 0 or i >= len(self.samples):
+                continue
+            if self.samples[i]["is_object"] == 0:
+                self.neg_hard_scores[i] = max(float(self.neg_hard_scores[i]), float(score))
+
+    def build_epoch_indices_for_hnm(
+        self,
+        epoch: int,
+        seed: int,
+        hard_ratio: float,
+        pool_frac: float,
+    ) -> List[int]:
+        if len(self.pos_dataset_indices) == 0 or len(self.neg_dataset_indices) == 0:
+            idxs = list(range(len(self.samples)))
+            rng = np.random.default_rng(seed + epoch)
+            rng.shuffle(idxs)
+            return idxs
+
+        rng = np.random.default_rng(seed + epoch)
+        pos = list(self.pos_dataset_indices)
+        n_pos = len(pos)
+        n_neg = n_pos
+
+        neg = np.array(self.neg_dataset_indices, dtype=np.int64)
+        neg_scores = self.neg_hard_scores[neg]
+        pool_n = max(1, int(len(neg) * max(0.0, min(1.0, pool_frac))))
+        hard_order = np.argsort(-neg_scores)
+        hard_pool = neg[hard_order[:pool_n]]
+
+        hard_take = min(len(hard_pool), int(n_neg * max(0.0, min(1.0, hard_ratio))))
+        hard_sel = rng.choice(hard_pool, size=hard_take, replace=False).tolist() if hard_take > 0 else []
+
+        remaining = n_neg - len(hard_sel)
+        neg_set = set(neg.tolist())
+        hard_set = set(hard_pool.tolist())
+        rest_pool = np.array(sorted(list(neg_set - hard_set)), dtype=np.int64)
+        if len(rest_pool) == 0:
+            rest_pool = neg
+        rest_take = min(len(rest_pool), remaining)
+        rest_sel = rng.choice(rest_pool, size=rest_take, replace=False).tolist() if rest_take > 0 else []
+
+        if len(hard_sel) + len(rest_sel) < n_neg:
+            fill = n_neg - (len(hard_sel) + len(rest_sel))
+            extra = rng.choice(neg, size=fill, replace=(fill > len(neg))).tolist()
+            rest_sel.extend(extra)
+
+        idxs = pos + hard_sel + rest_sel
+        rng.shuffle(idxs)
+        return idxs
+
+    def _low_vis_augment(self, tile: Image.Image) -> Image.Image:
+        # Strong low-visibility simulation: blur/haze/contrast/gamma/jpeg artifacts.
+        img = tile
+        if random.random() < 0.9:
+            bf = random.uniform(0.6, 1.35)
+            cf = random.uniform(0.55, 1.35)
+            sf = random.uniform(0.5, 1.2)
+            hf = random.uniform(-0.03, 0.03)
+            img = TF.adjust_brightness(img, bf)
+            img = TF.adjust_contrast(img, cf)
+            img = TF.adjust_saturation(img, sf)
+            img = TF.adjust_hue(img, hf)
+        if random.random() < 0.45:
+            img = TF.gaussian_blur(img, kernel_size=[3, 3], sigma=[0.1, 1.4])
+        if random.random() < 0.35:
+            gamma = random.uniform(0.7, 1.5)
+            img = TF.adjust_gamma(img, gamma)
+        if random.random() < 0.4:
+            # JPEG compression artifacts
+            buf = io.BytesIO()
+            q = random.randint(25, 65)
+            img.save(buf, format="JPEG", quality=q)
+            buf.seek(0)
+            img = Image.open(buf).convert("RGB")
+        return img
 
     def __getitem__(self, idx: int) -> Dict:
         item = self.samples[idx]
         ridx = item["ridx"]
         x0 = item["x0"]
         y0 = item["y0"]
+        src_tile_size = int(item["src_tile_size"])
         r = self.records[ridx]
 
         img = Image.open(r["image_path"]).convert("RGB")
-        tile = crop_with_pad(img, x0, y0, self.tile_size)
+        tile = crop_with_pad(img, x0, y0, src_tile_size)
+        if src_tile_size != self.tile_size:
+            tile = tile.resize((self.tile_size, self.tile_size), Image.BILINEAR)
+        if self.is_train and self.augment_low_vis:
+            tile = self._low_vis_augment(tile)
 
-        seg_t = build_seg_target(self.tile_size, item["objs"], self.seg_out_stride)
+        scale = float(self.tile_size) / float(max(src_tile_size, 1))
+        objs_scaled = []
+        for o in item["objs"]:
+            bx0, by0, bx1, by1 = o["bbox_xyxy"]
+            spts = [[float(px) * scale, float(py) * scale] for px, py in (o.get("points", []) or [])]
+            objs_scaled.append(
+                {
+                    "bbox_xyxy": [bx0 * scale, by0 * scale, bx1 * scale, by1 * scale],
+                    "points": spts,
+                    "shape_type": o.get("shape_type", "polygon"),
+                    "poly_area": o["poly_area"],
+                }
+            )
+
+        seg_t = build_seg_target(self.tile_size, objs_scaled, self.seg_out_stride)
+
+        # Build a zoom ROI classification target:
+        # positives use largest object bbox with context; negatives use deterministic random background crop.
+        if len(objs_scaled) > 0:
+            best = None
+            best_area = -1.0
+            for o in objs_scaled:
+                bx0, by0, bx1, by1 = o["bbox_xyxy"]
+                a = float(max(0.0, bx1 - bx0) * max(0.0, by1 - by0))
+                if a > best_area:
+                    best_area = a
+                    best = (float(bx0), float(by0), float(bx1), float(by1))
+            assert best is not None
+            bx0, by0, bx1, by1 = best
+            cx = 0.5 * (bx0 + bx1)
+            cy = 0.5 * (by0 + by1)
+            bw = max(10.0, (bx1 - bx0) * 1.8)
+            bh = max(10.0, (by1 - by0) * 1.8)
+            zx0 = max(0.0, cx - bw * 0.5)
+            zy0 = max(0.0, cy - bh * 0.5)
+            zx1 = min(float(self.tile_size), cx + bw * 0.5)
+            zy1 = min(float(self.tile_size), cy + bh * 0.5)
+            zoom_target = 1.0
+        else:
+            # Deterministic pseudo-random negative crop by dataset index.
+            rr = np.random.default_rng(self.seed * 1_000_003 + int(idx))
+            bw = float(rr.uniform(0.18, 0.45) * self.tile_size)
+            bh = float(rr.uniform(0.18, 0.45) * self.tile_size)
+            cx = float(rr.uniform(bw * 0.5, self.tile_size - bw * 0.5))
+            cy = float(rr.uniform(bh * 0.5, self.tile_size - bh * 0.5))
+            zx0 = max(0.0, cx - bw * 0.5)
+            zy0 = max(0.0, cy - bh * 0.5)
+            zx1 = min(float(self.tile_size), cx + bw * 0.5)
+            zy1 = min(float(self.tile_size), cy + bh * 0.5)
+            zoom_target = 0.0
+        # Ensure valid box extents.
+        if zx1 <= zx0:
+            zx1 = min(float(self.tile_size), zx0 + 2.0)
+        if zy1 <= zy0:
+            zy1 = min(float(self.tile_size), zy0 + 2.0)
 
         x = TF.to_tensor(tile)
         x = self.normalize(x)
@@ -340,11 +532,16 @@ class SegTileDataset(Dataset):
         return {
             "image": x,
             "seg_target": torch.from_numpy(seg_t).unsqueeze(0),
+            "tile_target": torch.tensor([float(item["is_object"])], dtype=torch.float32),
+            "zoom_target": torch.tensor([float(zoom_target)], dtype=torch.float32),
+            "zoom_box": torch.tensor([zx0, zy0, zx1, zy1], dtype=torch.float32),
             "meta": {
                 "image_path": r["image_path"],
                 "tile_origin": (x0, y0),
+                "source_tile_size": src_tile_size,
                 "num_objects": len(item["objs"]),
                 "is_positive_tile": int(item["is_object"]),
+                "sample_index": int(idx),
             },
         }
 
@@ -434,6 +631,135 @@ class SegmentationHead(nn.Module):
         return {"seg_logit": self.seg_head(x)}
 
 
+class AnyUpPointwiseSegHead(nn.Module):
+    def __init__(self, in_channels: int = 256):
+        super().__init__()
+        mid = max(1, in_channels // 2)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {"seg_logit": self.net(x)}
+
+
+class AnyUpDwSepSegHead(nn.Module):
+    def __init__(self, in_channels: int = 256):
+        super().__init__()
+        mid = max(1, in_channels // 2)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid),
+            nn.Conv2d(mid, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid),
+            nn.Conv2d(mid, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {"seg_logit": self.net(x)}
+
+
+class AnyUpResidualPointwiseSegHead(nn.Module):
+    def __init__(self, in_channels: int = 256):
+        super().__init__()
+        mid = max(1, in_channels // 2)
+        self.in_proj = nn.Conv2d(in_channels, mid, kernel_size=1)
+        self.block1 = nn.Sequential(
+            nn.Conv2d(mid, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=1),
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(mid, mid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=1),
+        )
+        self.act = nn.GELU()
+        self.out_proj = nn.Conv2d(mid, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        x = self.act(self.in_proj(x))
+        x = self.act(x + self.block1(x))
+        x = self.act(x + self.block2(x))
+        return {"seg_logit": self.out_proj(x)}
+
+
+class TileClassifierHead(nn.Module):
+    def __init__(self, in_channels: int = 256):
+        super().__init__()
+        hid = max(8, in_channels // 2)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1 = nn.Linear(in_channels, hid)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hid, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W) -> (B, 1) tile-level object logit
+        z = self.pool(x).flatten(1)
+        z = self.act(self.fc1(z))
+        return self.fc2(z)
+
+
+class ZoomRoiClassifierHead(nn.Module):
+    def __init__(self, in_channels: int = 256, roi_size: int = 8):
+        super().__init__()
+        self.roi_size = int(roi_size)
+        hid = max(16, in_channels // 2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, hid, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(hid, 1)
+
+    def forward(self, feat: torch.Tensor, zoom_boxes: torch.Tensor, input_hw: Tuple[int, int]) -> torch.Tensor:
+        # feat: (B, C, Hf, Wf), zoom_boxes in input-image pixels (B, 4) [x0, y0, x1, y1]
+        b, _c, hf, wf = feat.shape
+        in_h, in_w = int(input_hw[0]), int(input_hw[1])
+        z = zoom_boxes.float()
+        if z.ndim == 3 and z.shape[1] == 1:
+            z = z[:, 0, :]
+        if z.ndim != 2 or z.shape[1] != 4:
+            raise ValueError(f"zoom_boxes must be (B,4), got {tuple(z.shape)}")
+        if z.shape[0] != b:
+            raise ValueError(f"zoom_boxes batch {z.shape[0]} != feat batch {b}")
+
+        x0 = z[:, 0].clamp(0.0, max(0.0, float(in_w - 1)))
+        y0 = z[:, 1].clamp(0.0, max(0.0, float(in_h - 1)))
+        x1 = z[:, 2].clamp(1.0, float(in_w))
+        y1 = z[:, 3].clamp(1.0, float(in_h))
+        x1 = torch.maximum(x1, x0 + 1.0)
+        y1 = torch.maximum(y1, y0 + 1.0)
+
+        sx = float(wf) / float(max(1, in_w))
+        sy = float(hf) / float(max(1, in_h))
+        rois = torch.zeros((b, 5), dtype=torch.float32, device=feat.device)
+        rois[:, 0] = torch.arange(0, b, device=feat.device, dtype=torch.float32)
+        rois[:, 1] = x0 * sx
+        rois[:, 2] = y0 * sy
+        rois[:, 3] = x1 * sx
+        rois[:, 4] = y1 * sy
+
+        pooled = torchvision.ops.roi_align(
+            feat,
+            rois,
+            output_size=(self.roi_size, self.roi_size),
+            spatial_scale=1.0,
+            aligned=True,
+        )
+        zf = self.conv(pooled)
+        zf = self.pool(zf).flatten(1)
+        return self.fc(zf)
+
+
 class Stage1SegNet(nn.Module):
     def __init__(
         self,
@@ -441,11 +767,19 @@ class Stage1SegNet(nn.Module):
         trust_repo: bool = True,
         dino_upsampler_type: str = "learned",
         anyup_q_chunk_size: int = 256,
+        head_type: str = "pointwise",
+        use_tile_cls_head: bool = False,
+        use_zoom_cls_head: bool = False,
     ):
         super().__init__()
         if dino_upsampler_type not in {"learned", "anyup"}:
             raise ValueError(f"Unsupported dino_upsampler_type={dino_upsampler_type}")
+        if head_type not in {"pointwise", "dwsep", "residual"}:
+            raise ValueError(f"Unsupported head_type={head_type}")
         self.dino_upsampler_type = dino_upsampler_type
+        self.head_type = head_type
+        self.use_tile_cls_head = bool(use_tile_cls_head)
+        self.use_zoom_cls_head = bool(use_zoom_cls_head)
         self.dino = FrozenDinoTokenBranch(channels, trust_repo=trust_repo)
         self.dino_up = DinoLearnedUpsampler(channels)
         self.dino_anyup: Optional[AnyUpFeatureUpsampler] = None
@@ -454,24 +788,51 @@ class Stage1SegNet(nn.Module):
                 q_chunk_size=anyup_q_chunk_size,
                 trust_repo=trust_repo,
             )
-        self.local = ResNet18LocalBranch(channels)
-        self.fuse_1x1 = nn.Conv2d(channels + 64, channels, kernel_size=1)
-        self.head = SegmentationHead(channels)
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        fdino = self.dino(x)
-        flocal = self.local(x)
-        if self.dino_upsampler_type == "anyup" and self.dino_anyup is not None:
-            fdino_up = self.dino_anyup(x, fdino, target_hw=flocal.shape[-2:])
+        if self.dino_upsampler_type == "anyup":
+            self.local = None
+            self.fuse_1x1 = None
+            if self.head_type == "pointwise":
+                self.anyup_head = AnyUpPointwiseSegHead(channels)
+            elif self.head_type == "dwsep":
+                self.anyup_head = AnyUpDwSepSegHead(channels)
+            else:
+                self.anyup_head = AnyUpResidualPointwiseSegHead(channels)
+            self.head = None
+            self.tile_cls_head = TileClassifierHead(channels) if self.use_tile_cls_head else None
+            self.zoom_cls_head = ZoomRoiClassifierHead(channels) if self.use_zoom_cls_head else None
         else:
-            fdino_up = self.dino_up(fdino, target_hw=flocal.shape[-2:])
+            self.local = ResNet18LocalBranch(channels)
+            self.fuse_1x1 = nn.Conv2d(channels + 64, channels, kernel_size=1)
+            self.head = SegmentationHead(channels)
+            self.anyup_head = None
+            self.tile_cls_head = TileClassifierHead(channels) if self.use_tile_cls_head else None
+            self.zoom_cls_head = ZoomRoiClassifierHead(channels) if self.use_zoom_cls_head else None
 
-        fused = torch.cat([fdino_up, flocal], dim=1)
-        fused = self.fuse_1x1(fused)
-        out = self.head(fused)
+    def forward(self, x: torch.Tensor, zoom_boxes: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        fdino = self.dino(x)
+        if self.dino_upsampler_type == "anyup" and self.dino_anyup is not None:
+            # In AnyUp mode, upsample token features to the native tile size.
+            fdino_up = self.dino_anyup(x, fdino, target_hw=x.shape[-2:])
+            out = self.anyup_head(fdino_up)
+            cls_feat = fdino_up
+        else:
+            flocal = self.local(x)
+            fdino_up = self.dino_up(fdino, target_hw=flocal.shape[-2:])
+            fused = torch.cat([fdino_up, flocal], dim=1)
+            fused = self.fuse_1x1(fused)
+            out = self.head(fused)
+            cls_feat = fused
 
         target_hw = (x.shape[-2] // 4, x.shape[-1] // 4)
         out["seg_logit"] = F.interpolate(out["seg_logit"], size=target_hw, mode="bilinear", align_corners=False)
+        if self.tile_cls_head is not None:
+            out["tile_logit"] = self.tile_cls_head(cls_feat)
+        if self.zoom_cls_head is not None and zoom_boxes is not None:
+            out["zoom_logit"] = self.zoom_cls_head(
+                cls_feat,
+                zoom_boxes=zoom_boxes,
+                input_hw=(x.shape[-2], x.shape[-1]),
+            )
         return out
 
 
@@ -493,17 +854,80 @@ def mcc_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float
     return 1.0 - mcc.mean()
 
 
-def mask_iou_at_threshold(pred_logit: torch.Tensor, seg_target: torch.Tensor, thr: float = 0.5, eps: float = 1e-7) -> float:
-    pred = (torch.sigmoid(pred_logit) > thr).float()
+def boundary_map(x: torch.Tensor) -> torch.Tensor:
+    # x: (B,1,H,W), values in [0,1]
+    dil = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+    ero = -F.max_pool2d(-x, kernel_size=3, stride=1, padding=1)
+    return (dil - ero).clamp(0.0, 1.0)
+
+
+def mcc_bce_boundary_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mcc_weight: float,
+    bce_weight: float,
+    boundary_weight: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    targets = targets.float()
+    mcc = mcc_loss_with_logits(logits, targets)
+    bce = F.binary_cross_entropy_with_logits(logits, targets)
+
+    probs = torch.sigmoid(logits)
+    pred_b = boundary_map(probs)
+    tgt_b = boundary_map(targets)
+    bnd = F.binary_cross_entropy(pred_b, tgt_b)
+
+    total = mcc_weight * mcc + bce_weight * bce + boundary_weight * bnd
+    parts = {
+        "mcc": float(mcc.detach().item()),
+        "bce": float(bce.detach().item()),
+        "boundary": float(bnd.detach().item()),
+        "total": float(total.detach().item()),
+    }
+    return total, parts
+
+
+def segmentation_metrics(
+    pred_logit: torch.Tensor,
+    seg_target: torch.Tensor,
+    thr: float = 0.5,
+    eps: float = 1e-7,
+) -> Dict[str, float]:
+    probs = torch.sigmoid(pred_logit).float()
     tgt = seg_target.float()
 
-    pred = pred.view(pred.shape[0], -1)
-    tgt = tgt.view(tgt.shape[0], -1)
+    probs_f = probs.view(probs.shape[0], -1)
+    tgt_f = tgt.view(tgt.shape[0], -1)
 
-    inter = (pred * tgt).sum(dim=1)
-    union = ((pred + tgt) > 0).float().sum(dim=1)
-    iou = torch.where(union > 0, inter / (union + eps), torch.ones_like(union))
-    return float(iou.mean().item())
+    inter = (probs_f * tgt_f).sum(dim=1)
+    union = (probs_f + tgt_f - probs_f * tgt_f).sum(dim=1)
+    valid_union = union > eps
+    if bool(valid_union.any().item()):
+        soft_iou = float((inter[valid_union] / (union[valid_union] + eps)).mean().item())
+    else:
+        soft_iou = float("nan")
+
+    pos_mask = tgt_f.sum(dim=1) > 0
+    if bool(pos_mask.any().item()):
+        pos_inter = inter[pos_mask]
+        pos_union = union[pos_mask]
+        pos_iou = float((pos_inter / (pos_union + eps)).mean().item())
+    else:
+        pos_iou = float("nan")
+
+    pred_bin = (probs_f > thr).float()
+    neg_mask = ~pos_mask
+    if bool(neg_mask.any().item()):
+        neg_has_fp = (pred_bin[neg_mask].sum(dim=1) > 0).float()
+        neg_fp_rate = float(neg_has_fp.mean().item())
+    else:
+        neg_fp_rate = float("nan")
+
+    return {
+        "soft_iou": soft_iou,
+        "pos_iou": pos_iou,
+        "neg_fp_rate": neg_fp_rate,
+    }
 
 
 def unnormalize_image(x: torch.Tensor) -> np.ndarray:
@@ -617,41 +1041,215 @@ def run_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     iou_threshold: float,
+    mcc_weight: float,
+    bce_weight: float,
+    boundary_weight: float,
+    tile_cls_weight: float,
+    zoom_cls_weight: float,
     train: bool,
     epoch: int,
     split_name: str,
+    collect_hard_scores: bool = False,
+    writer: SummaryWriter | None = None,
+    global_step_start: int = 0,
+    dataloader_verbose: bool = False,
 ):
     model.train(train)
     if not train:
         model.eval()
 
     total_losses = []
-    iou_scores = []
+    mcc_losses = []
+    bce_losses = []
+    boundary_losses = []
+    tile_cls_losses = []
+    zoom_cls_losses = []
+    soft_iou_scores = []
+    pos_iou_scores = []
+    neg_fp_rates = []
+    hard_scores: Dict[int, float] = {}
 
-    pbar = tqdm(loader, desc=f"{split_name} epoch {epoch:02d}", leave=False)
+    pbar = tqdm(loader, desc=f"{split_name} epoch {epoch:02d}", leave=dataloader_verbose)
+    step_count = 0
+    last_step_time = time.time()
     for batch in pbar:
+        now = time.time()
+        data_time = now - last_step_time
         x = batch["image"].to(device)
         seg_t = batch["seg_target"].to(device)
+        tile_t = batch["tile_target"].to(device)
+        zoom_t = batch.get("zoom_target", None)
+        zoom_box = batch.get("zoom_box", None)
+        if zoom_t is not None:
+            zoom_t = zoom_t.to(device)
+        if zoom_box is not None:
+            zoom_box = zoom_box.to(device)
+        grad_norm_val: Optional[float] = None
 
         with torch.set_grad_enabled(train):
-            pred = model(x)
-            loss = mcc_loss_with_logits(pred["seg_logit"], seg_t)
+            pred = model(x, zoom_boxes=zoom_box)
+            loss, parts = mcc_bce_boundary_loss(
+                pred["seg_logit"],
+                seg_t,
+                mcc_weight=mcc_weight,
+                bce_weight=bce_weight,
+                boundary_weight=boundary_weight,
+            )
+            tile_cls_val = float("nan")
+            if ("tile_logit" in pred) and (tile_cls_weight > 0):
+                tile_bce = F.binary_cross_entropy_with_logits(pred["tile_logit"], tile_t)
+                loss = loss + tile_cls_weight * tile_bce
+                tile_cls_val = float(tile_bce.detach().item())
+            parts["tile_cls"] = tile_cls_val
+            zoom_cls_val = float("nan")
+            if ("zoom_logit" in pred) and (zoom_cls_weight > 0) and (zoom_t is not None):
+                zoom_bce = F.binary_cross_entropy_with_logits(pred["zoom_logit"], zoom_t)
+                loss = loss + zoom_cls_weight * zoom_bce
+                zoom_cls_val = float(zoom_bce.detach().item())
+            parts["zoom_cls"] = zoom_cls_val
+            parts["total"] = float(loss.detach().item())
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                total_norm_sq = 0.0
+                for p in model.parameters():
+                    if p.grad is None:
+                        continue
+                    g = p.grad.detach()
+                    param_norm = float(g.norm(2).item())
+                    total_norm_sq += param_norm * param_norm
+                grad_norm_val = math.sqrt(total_norm_sq)
                 optimizer.step()
 
         loss_val = float(loss.detach().cpu())
-        iou_val = mask_iou_at_threshold(pred["seg_logit"].detach(), seg_t, thr=iou_threshold)
+        metric_vals = segmentation_metrics(pred["seg_logit"].detach(), seg_t, thr=iou_threshold)
+        soft_iou_val = metric_vals["soft_iou"]
+        pos_iou_val = metric_vals["pos_iou"]
+        neg_fp_val = metric_vals["neg_fp_rate"]
         total_losses.append(loss_val)
-        iou_scores.append(iou_val)
+        mcc_losses.append(parts["mcc"])
+        bce_losses.append(parts["bce"])
+        boundary_losses.append(parts["boundary"])
+        tile_cls_losses.append(parts["tile_cls"])
+        zoom_cls_losses.append(parts["zoom_cls"])
+        soft_iou_scores.append(soft_iou_val)
+        pos_iou_scores.append(pos_iou_val)
+        neg_fp_rates.append(neg_fp_val)
 
-        pbar.set_postfix({"loss": f"{loss_val:.4f}", "iou": f"{iou_val:.3f}"})
+        if collect_hard_scores:
+            probs = torch.sigmoid(pred["seg_logit"].detach())
+            neg_mask = (seg_t.view(seg_t.shape[0], -1).sum(dim=1) == 0)
+            meta = batch.get("meta", {})
+            idxs = meta.get("sample_index", None)
+            if idxs is not None:
+                if torch.is_tensor(idxs):
+                    idx_list = idxs.detach().cpu().tolist()
+                elif isinstance(idxs, list):
+                    idx_list = [int(v) for v in idxs]
+                else:
+                    idx_list = []
+                for bi, ds_idx in enumerate(idx_list):
+                    if bi >= probs.shape[0]:
+                        break
+                    if bool(neg_mask[bi].item()):
+                        hs = float(probs[bi, 0].max().item())
+                        prev = hard_scores.get(int(ds_idx), 0.0)
+                        if hs > prev:
+                            hard_scores[int(ds_idx)] = hs
+
+        if writer is not None:
+            gs = global_step_start + step_count
+            writer.add_scalar(f"loss_step/{split_name}_total", loss_val, gs)
+            writer.add_scalar(f"loss_step/{split_name}_mcc", parts["mcc"], gs)
+            writer.add_scalar(f"loss_step/{split_name}_bce", parts["bce"], gs)
+            writer.add_scalar(f"loss_step/{split_name}_boundary", parts["boundary"], gs)
+            if not math.isnan(parts["tile_cls"]):
+                writer.add_scalar(f"loss_step/{split_name}_tile_cls", parts["tile_cls"], gs)
+            if not math.isnan(parts["zoom_cls"]):
+                writer.add_scalar(f"loss_step/{split_name}_zoom_cls", parts["zoom_cls"], gs)
+            writer.add_scalar(f"metric_step/{split_name}_soft_iou", soft_iou_val, gs)
+            writer.add_scalar(f"metric_step/{split_name}_pos_iou", pos_iou_val, gs)
+            writer.add_scalar(f"metric_step/{split_name}_neg_fp_rate", neg_fp_val, gs)
+            # Backward-compatible alias: mask_iou now reports soft_iou.
+            writer.add_scalar(f"metric_step/{split_name}_mask_iou", soft_iou_val, gs)
+            if grad_norm_val is not None:
+                writer.add_scalar(f"grad_step/{split_name}_l2_norm", grad_norm_val, gs)
+        step_count += 1
+
+        postfix = {
+            "loss": f"{loss_val:.4f}",
+            "soft_iou": f"{soft_iou_val:.3f}",
+            "pos_iou": f"{pos_iou_val:.3f}",
+            "neg_fp": f"{neg_fp_val:.3f}",
+        }
+        if grad_norm_val is not None:
+            postfix["grad"] = f"{grad_norm_val:.3f}"
+        if dataloader_verbose:
+            step_time = time.time() - now
+            postfix["data_s"] = f"{data_time:.3f}"
+            postfix["step_s"] = f"{step_time:.3f}"
+        pbar.set_postfix(postfix)
+        last_step_time = time.time()
 
     return {
         "total_loss": float(np.mean(total_losses)) if total_losses else float("nan"),
-        "mask_iou": float(np.mean(iou_scores)) if iou_scores else float("nan"),
+        "mcc_loss": float(np.mean(mcc_losses)) if mcc_losses else float("nan"),
+        "bce_loss": float(np.mean(bce_losses)) if bce_losses else float("nan"),
+        "boundary_loss": float(np.mean(boundary_losses)) if boundary_losses else float("nan"),
+        "tile_cls_loss": float(np.nanmean(tile_cls_losses)) if tile_cls_losses else float("nan"),
+        "zoom_cls_loss": float(np.nanmean(zoom_cls_losses)) if zoom_cls_losses else float("nan"),
+        "soft_iou": float(np.nanmean(soft_iou_scores)) if soft_iou_scores else float("nan"),
+        "pos_iou": float(np.nanmean(pos_iou_scores)) if pos_iou_scores else float("nan"),
+        "neg_fp_rate": float(np.nanmean(neg_fp_rates)) if neg_fp_rates else float("nan"),
+        # Backward-compatible alias: mask_iou now reports soft_iou.
+        "mask_iou": float(np.nanmean(soft_iou_scores)) if soft_iou_scores else float("nan"),
+        "hard_scores": hard_scores,
+        "num_steps": int(step_count),
     }
+
+
+def parse_tile_configs(tile_size: int, tile_stride: int, tile_scales: str) -> List[Tuple[int, int]]:
+    vals = []
+    for tok in str(tile_scales).split(","):
+        tok = tok.strip()
+        if tok == "":
+            continue
+        vals.append(float(tok))
+    if len(vals) == 0:
+        vals = [1.0]
+
+    out = []
+    seen = set()
+    for s in vals:
+        ts = max(14, int(round(tile_size * s)))
+        st = max(1, int(round(tile_stride * s)))
+        key = (ts, st)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def get_epoch_mcc_weight(target_weight: float, warmup_epochs: int, epoch: int) -> float:
+    if warmup_epochs <= 0:
+        return float(target_weight)
+    if epoch <= 0:
+        return 0.0
+    if epoch >= warmup_epochs:
+        return float(target_weight)
+    return float(target_weight) * (float(epoch) / float(warmup_epochs))
+
+
+def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Cfg):
+    if cfg.lr_scheduler == "none":
+        return None
+    if cfg.lr_scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, cfg.epochs),
+            eta_min=cfg.lr_min,
+        )
+    raise ValueError(f"Unsupported lr_scheduler: {cfg.lr_scheduler}")
 
 
 def parse_args() -> Cfg:
@@ -660,38 +1258,63 @@ def parse_args() -> Cfg:
     ap.add_argument("--data-dir", type=Path, default=Path("data/record_pairs"))
     ap.add_argument("--output-dir", type=Path, default=Path("runs"))
     ap.add_argument("--run-name", type=str, default="")
+    ap.add_argument("--resume-checkpoint", type=Path, default=None)
 
     ap.add_argument("--tile-size", type=int, default=224)
     ap.add_argument("--tile-stride", type=int, default=112)
+    ap.add_argument("--tile-scales", type=str, default="1.0", help="Comma-separated scale factors for mixed tiling, e.g. 1.0,1.5")
 
-    ap.add_argument("--label-name", type=str, default="vehicle")
+    ap.add_argument("--label", dest="label_name", type=str, default="vehicle")
+    ap.add_argument("--label-name", dest="label_name", type=str, help=argparse.SUPPRESS)
     ap.add_argument("--min-poly-points", type=int, default=3)
 
     ap.add_argument("--seg-out-stride", type=int, default=4)
 
     ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--dataloader-verbose", action="store_true", default=True)
+    ap.add_argument("--no-dataloader-verbose", action="store_false", dest="dataloader_verbose")
     ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr-scheduler", type=str, choices=["none", "cosine"], default="cosine")
+    ap.add_argument("--lr-min", type=float, default=1e-5)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
 
     ap.add_argument("--fusion-channels", type=int, default=256)
-    ap.add_argument("--dino-upsampler-type", type=str, choices=["learned", "anyup"], default="learned")
+    ap.add_argument("--dino-upsampler", dest="dino_upsampler_type", type=str, choices=["learned", "anyup"], default="learned")
+    ap.add_argument("--dino-upsampler-type", dest="dino_upsampler_type", type=str, choices=["learned", "anyup"], help=argparse.SUPPRESS)
     ap.add_argument("--anyup-q-chunk-size", type=int, default=256)
+    ap.add_argument("--head-type", type=str, choices=["pointwise", "dwsep", "residual"], default="pointwise")
+    ap.add_argument("--use-tile-cls-head", action="store_true", default=True)
+    ap.add_argument("--no-use-tile-cls-head", action="store_false", dest="use_tile_cls_head")
+    ap.add_argument("--tile-cls-weight", type=float, default=0.3)
+    ap.add_argument("--use-zoom-cls-head", action="store_true", default=True)
+    ap.add_argument("--no-use-zoom-cls-head", action="store_false", dest="use_zoom_cls_head")
+    ap.add_argument("--zoom-cls-weight", type=float, default=0.2)
 
     ap.add_argument("--balance-train-50-50", action="store_true", default=True)
     ap.add_argument("--no-balance-train-50-50", action="store_false", dest="balance_train_50_50")
-    ap.add_argument("--balance-val-50-50", action="store_true", default=False)
+    ap.add_argument("--balance-val-50-50", action="store_true", default=True)
+    ap.add_argument("--no-balance-val-50-50", action="store_false", dest="balance_val_50_50")
+    ap.add_argument("--augment-low-vis", action="store_true", default=False)
+    ap.add_argument("--hard-negative-mining", action="store_true", default=True)
+    ap.add_argument("--no-hard-negative-mining", action="store_false", dest="hard_negative_mining")
+    ap.add_argument("--hnm-hard-ratio", type=float, default=0.3, help="Fraction of sampled negatives drawn from hard pool.")
+    ap.add_argument("--hnm-pool-frac", type=float, default=0.2, help="Top fraction of negative samples considered hard pool.")
 
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--subset-size", type=int, default=0, help="Number of records (images) to train/eval split on. 0 = all.")
 
-    ap.add_argument("--val-interval", type=int, default=1)
+    ap.add_argument("--val-interval", type=int, default=5)
     ap.add_argument("--train-example-items", type=int, default=3)
     ap.add_argument("--val-example-items", type=int, default=3)
     ap.add_argument("--image-log-interval", type=int, default=1)
 
     ap.add_argument("--iou-threshold", type=float, default=0.5)
+    ap.add_argument("--mcc-weight", type=float, default=0.4)
+    ap.add_argument("--mcc-warmup-epochs", type=int, default=3)
+    ap.add_argument("--bce-weight", type=float, default=0.5)
+    ap.add_argument("--boundary-weight", type=float, default=0.2)
 
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
     ap.add_argument("--no-trust-torch-hub-repo", action="store_false", dest="trust_torch_hub_repo")
@@ -702,21 +1325,35 @@ def parse_args() -> Cfg:
         data_dir=a.data_dir,
         output_dir=a.output_dir,
         run_name=a.run_name,
+        resume_checkpoint=a.resume_checkpoint,
         tile_size=a.tile_size,
         tile_stride=a.tile_stride,
+        tile_scales=a.tile_scales,
         label_name=a.label_name,
         min_poly_points=a.min_poly_points,
         seg_out_stride=a.seg_out_stride,
         batch_size=a.batch_size,
         num_workers=a.num_workers,
+        dataloader_verbose=a.dataloader_verbose,
         epochs=a.epochs,
         lr=a.lr,
+        lr_scheduler=a.lr_scheduler,
+        lr_min=a.lr_min,
         weight_decay=a.weight_decay,
         fusion_channels=a.fusion_channels,
         dino_upsampler_type=a.dino_upsampler_type,
         anyup_q_chunk_size=a.anyup_q_chunk_size,
+        head_type=a.head_type,
+        use_tile_cls_head=a.use_tile_cls_head,
+        tile_cls_weight=a.tile_cls_weight,
+        use_zoom_cls_head=a.use_zoom_cls_head,
+        zoom_cls_weight=a.zoom_cls_weight,
         balance_train_50_50=a.balance_train_50_50,
         balance_val_50_50=a.balance_val_50_50,
+        augment_low_vis=a.augment_low_vis,
+        hard_negative_mining=a.hard_negative_mining,
+        hnm_hard_ratio=a.hnm_hard_ratio,
+        hnm_pool_frac=a.hnm_pool_frac,
         seed=a.seed,
         subset_size=a.subset_size,
         val_interval=a.val_interval,
@@ -724,6 +1361,10 @@ def parse_args() -> Cfg:
         val_example_items=a.val_example_items,
         image_log_interval=a.image_log_interval,
         iou_threshold=a.iou_threshold,
+        mcc_weight=a.mcc_weight,
+        mcc_warmup_epochs=a.mcc_warmup_epochs,
+        bce_weight=a.bce_weight,
+        boundary_weight=a.boundary_weight,
         trust_torch_hub_repo=a.trust_torch_hub_repo,
     )
 
@@ -735,8 +1376,23 @@ def main() -> None:
     if not cfg.data_dir.exists():
         raise FileNotFoundError(f"Missing data dir: {cfg.data_dir}")
 
+    resume_ckpt = cfg.resume_checkpoint
+    resume_blob = None
+    if resume_ckpt is not None:
+        if not resume_ckpt.exists():
+            raise FileNotFoundError(f"Missing resume checkpoint: {resume_ckpt}")
+        try:
+            resume_blob = torch.load(resume_ckpt, map_location="cpu", weights_only=True)
+        except Exception:
+            # Older checkpoints may require full unpickling.
+            resume_blob = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_slug = stamp if cfg.run_name == "" else f"{stamp}-{cfg.run_name}"
+    if cfg.run_name == "":
+        run_suffix = "resume" if resume_ckpt is not None else ""
+        run_slug = f"{stamp}-{run_suffix}" if run_suffix else stamp
+    else:
+        run_slug = f"{stamp}-{cfg.run_name}"
     run_dir = cfg.output_dir / run_slug
     ckpt_dir = run_dir / "checkpoints"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -760,39 +1416,70 @@ def main() -> None:
     records = [records[i] for i in order]
     print(f"Loaded records={len(records)}")
     print("Effective flags:")
+    print(f"  resume_checkpoint={str(cfg.resume_checkpoint) if cfg.resume_checkpoint else 'None'}")
+    if cfg.resume_checkpoint is not None:
+        print("  note: --epochs is interpreted as additional epochs when resuming")
+        print("  note: resume always writes to a new run directory")
+        print("  note: resume resets LR/scheduler to cfg.lr/cfg.lr_min for the new run")
     print(f"  balance_train_50_50={cfg.balance_train_50_50}")
     print(f"  balance_val_50_50={cfg.balance_val_50_50}")
     print(f"  subset_size={cfg.subset_size} (applied after balancing/shuffle)")
     print(f"  tile_size={cfg.tile_size}, tile_stride={cfg.tile_stride}")
+    print(f"  tile_scales={cfg.tile_scales}")
     print(f"  seg_out_stride={cfg.seg_out_stride}")
     print(f"  batch_size={cfg.batch_size}, num_workers={cfg.num_workers}")
+    print(f"  dataloader_verbose={cfg.dataloader_verbose}")
     print(f"  dino_upsampler_type={cfg.dino_upsampler_type}")
     if cfg.dino_upsampler_type == "anyup":
         print(f"  anyup_q_chunk_size={cfg.anyup_q_chunk_size}")
+        print(f"  head_type={cfg.head_type}")
+    print(f"  use_tile_cls_head={cfg.use_tile_cls_head} tile_cls_weight={cfg.tile_cls_weight}")
+    print(f"  use_zoom_cls_head={cfg.use_zoom_cls_head} zoom_cls_weight={cfg.zoom_cls_weight}")
     print(f"  val_interval={cfg.val_interval}, image_log_interval={cfg.image_log_interval}")
     print(f"  iou_threshold={cfg.iou_threshold}")
+    print(
+        f"  loss={cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + "
+        f"{cfg.boundary_weight}*boundary + {cfg.tile_cls_weight}*tile_cls + "
+        f"{cfg.zoom_cls_weight}*zoom_cls"
+    )
+    print(f"  mcc_warmup_epochs={cfg.mcc_warmup_epochs}")
+    print(f"  lr={cfg.lr} lr_scheduler={cfg.lr_scheduler} lr_min={cfg.lr_min}")
+    print(f"  augment_low_vis={cfg.augment_low_vis}")
+    print(
+        f"  hard_negative_mining={cfg.hard_negative_mining} "
+        f"(hard_ratio={cfg.hnm_hard_ratio}, pool_frac={cfg.hnm_pool_frac})"
+    )
 
     split = int(0.95 * len(records))
     train_records = records[:split]
     val_records = records[split:]
 
+    tile_configs = parse_tile_configs(cfg.tile_size, cfg.tile_stride, cfg.tile_scales)
+    print(f"  tile_configs={tile_configs}")
+
     train_ds = SegTileDataset(
         train_records,
         tile_size=cfg.tile_size,
-        stride=cfg.tile_stride,
+        tile_configs=tile_configs,
         seg_out_stride=cfg.seg_out_stride,
         seed=cfg.seed,
         balance_50_50=cfg.balance_train_50_50,
+        augment_low_vis=cfg.augment_low_vis,
+        is_train=True,
         dataset_name="train",
+        verbose=cfg.dataloader_verbose,
     )
     val_ds = SegTileDataset(
         val_records,
         tile_size=cfg.tile_size,
-        stride=cfg.tile_stride,
+        tile_configs=tile_configs,
         seg_out_stride=cfg.seg_out_stride,
         seed=cfg.seed,
         balance_50_50=cfg.balance_val_50_50,
+        augment_low_vis=False,
+        is_train=False,
         dataset_name="val",
+        verbose=cfg.dataloader_verbose,
     )
 
     # Apply subset at the end: balancing has already been applied in dataset generation.
@@ -803,12 +1490,14 @@ def main() -> None:
         train_ds.samples = [train_ds.samples[i] for i in keep_idx]
         train_ds.pos_dataset_indices = [i for i, s in enumerate(train_ds.samples) if s["is_object"] == 1]
         train_ds.neg_dataset_indices = [i for i, s in enumerate(train_ds.samples) if s["is_object"] == 0]
+        train_ds.neg_hard_scores = np.zeros(len(train_ds.samples), dtype=np.float32)
         print(
             f"Applied subset_size={cfg.subset_size} after balancing. "
             f"effective_train_tiles={len(train_ds)}"
         )
     else:
         print(f"Using full train set after dataset balancing step. effective_train_tiles={len(train_ds)}")
+        train_ds.neg_hard_scores = np.zeros(len(train_ds.samples), dtype=np.float32)
 
     print(
         f"train_tile_balance: pos={len(getattr(train_ds, 'pos_dataset_indices', []))} "
@@ -818,12 +1507,11 @@ def main() -> None:
         found = discover_labels(cfg.data_dir)
         raise RuntimeError(
             "No positive train tiles found after dataset build. "
-            f"Current --label-name='{cfg.label_name}'. "
+            f"Current --label='{cfg.label_name}'. "
             f"Discovered labels in dataset: {found}. "
-            "Set --label-name to the correct class (e.g. 'Tank' or 'enemy')."
+            "Set --label to the correct class (e.g. 'Tank' or 'enemy')."
         )
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -835,43 +1523,176 @@ def main() -> None:
         trust_repo=cfg.trust_torch_hub_repo,
         dino_upsampler_type=cfg.dino_upsampler_type,
         anyup_q_chunk_size=cfg.anyup_q_chunk_size,
+        head_type=cfg.head_type,
+        use_tile_cls_head=cfg.use_tile_cls_head,
+        use_zoom_cls_head=cfg.use_zoom_cls_head,
     ).to(device)
 
     # Freeze both backbones to reduce overfitting.
     for p in model.dino.parameters():
         p.requires_grad = False
-    for p in model.local.parameters():
-        p.requires_grad = False
-    # In anyup mode, keep the learned upsampler frozen and use AnyUp instead.
+    if model.local is not None:
+        for p in model.local.parameters():
+            p.requires_grad = False
+    # In anyup mode, keep the learned upsampler frozen and use AnyUp directly.
     if cfg.dino_upsampler_type == "anyup":
         for p in model.dino_up.parameters():
             p.requires_grad = False
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = build_lr_scheduler(optimizer, cfg)
 
     if cfg.dino_upsampler_type == "anyup":
-        module_msg = "fuse_1x1, head (AnyUp + backbones frozen)"
+        module_msg = f"anyup_head[{cfg.head_type}] (AnyUp + backbones frozen)"
     else:
         module_msg = "dino_up, fuse_1x1, head"
+    if cfg.use_tile_cls_head:
+        module_msg = f"{module_msg}, tile_cls_head"
+    if cfg.use_zoom_cls_head:
+        module_msg = f"{module_msg}, zoom_cls_head"
     print(f"trainable modules: {module_msg} | trainable_params={sum(p.numel() for p in trainable)}")
 
     history = []
     best_val_iou = -1.0
+    train_global_step = 0
+    val_global_step = 0
+    start_epoch = 1
+    resume_base_epoch = 0
+    target_end_epoch = cfg.epochs
 
-    for epoch in range(1, cfg.epochs + 1):
+    if resume_blob is not None:
+        state = resume_blob["model"] if isinstance(resume_blob, dict) and "model" in resume_blob else resume_blob
+        try:
+            model.load_state_dict(state, strict=True)
+        except RuntimeError as e:
+            print(
+                "warning: strict resume load failed; retrying with strict=False "
+                f"(likely architecture delta such as zoom head). error={e}"
+            )
+            model.load_state_dict(state, strict=False)
+        resume_cfg = resume_blob.get("cfg", {}) if isinstance(resume_blob, dict) else {}
+        resume_has_zoom_head = bool(resume_cfg.get("use_zoom_cls_head", False))
+        optimizer_loaded = False
+        if isinstance(resume_blob, dict) and "optimizer" in resume_blob:
+            # If architecture changed (e.g., zoom head added), optimizer param groups may mismatch.
+            if resume_has_zoom_head != bool(cfg.use_zoom_cls_head):
+                print(
+                    "warning: resume checkpoint optimizer state skipped due to model head mismatch "
+                    f"(checkpoint use_zoom_cls_head={resume_has_zoom_head}, "
+                    f"current use_zoom_cls_head={cfg.use_zoom_cls_head}). "
+                    "Using freshly initialized optimizer state."
+                )
+            else:
+                try:
+                    optimizer.load_state_dict(resume_blob["optimizer"])
+                    optimizer_loaded = True
+                except Exception as e:
+                    print(
+                        "warning: failed to load optimizer state from resume checkpoint "
+                        f"(likely parameter-group mismatch after architecture change): {e}. "
+                        "Using freshly initialized optimizer state."
+                    )
+        # Resume policy: start each resumed run with a fresh LR schedule from cfg.lr -> cfg.lr_min.
+        # Loading an old CosineAnnealingLR state at/after T_max can make LR rise again.
+        if optimizer_loaded:
+            print("note: optimizer state loaded; resetting LR to cfg.lr and restarting scheduler for this resumed run.")
+        else:
+            print("note: using fresh optimizer state; initializing LR/scheduler from cfg.")
+        for pg in optimizer.param_groups:
+            pg["lr"] = float(cfg.lr)
+            pg["initial_lr"] = float(cfg.lr)
+        scheduler = build_lr_scheduler(optimizer, cfg)
+
+        if isinstance(resume_blob, dict):
+            history = list(resume_blob.get("history", []))
+            best_val_iou = float(resume_blob.get("best_val_iou", best_val_iou))
+            resume_base_epoch = int(resume_blob.get("epoch", 0))
+            start_epoch = resume_base_epoch + 1
+            train_global_step = int(resume_blob.get("train_global_step", 0))
+            val_global_step = int(resume_blob.get("val_global_step", 0))
+
+        target_end_epoch = resume_base_epoch + cfg.epochs
+        print(
+            f"Resumed from {resume_ckpt} | start_epoch={start_epoch} "
+            f"target_end_epoch={target_end_epoch} "
+            f"best_val_iou={best_val_iou:.4f} train_global_step={train_global_step} "
+            f"val_global_step={val_global_step}"
+        )
+    else:
+        target_end_epoch = cfg.epochs
+
+    if start_epoch > target_end_epoch:
+        print(
+            f"Nothing to train: start_epoch={start_epoch} is greater than target_end_epoch={target_end_epoch}. "
+            "Increase --epochs to continue training."
+        )
+        return
+
+    for epoch in range(start_epoch, target_end_epoch + 1):
+        lr_now = float(optimizer.param_groups[0]["lr"])
+        epoch_mcc_weight = get_epoch_mcc_weight(
+            target_weight=cfg.mcc_weight,
+            warmup_epochs=cfg.mcc_warmup_epochs,
+            epoch=epoch,
+        )
+        if cfg.hard_negative_mining:
+            epoch_indices = train_ds.build_epoch_indices_for_hnm(
+                epoch=epoch,
+                seed=cfg.seed,
+                hard_ratio=cfg.hnm_hard_ratio,
+                pool_frac=cfg.hnm_pool_frac,
+            )
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=cfg.batch_size,
+                sampler=SubsetRandomSampler(epoch_indices),
+                num_workers=cfg.num_workers,
+            )
+        else:
+            train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
+        if cfg.dataloader_verbose:
+            print(
+                f"epoch={epoch:02d} loader_info: "
+                f"train_batches={len(train_loader)} val_batches={len(val_loader)} "
+                f"batch_size={cfg.batch_size} workers={cfg.num_workers}"
+            )
+
         tr = run_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
             iou_threshold=cfg.iou_threshold,
+            mcc_weight=epoch_mcc_weight,
+            bce_weight=cfg.bce_weight,
+            boundary_weight=cfg.boundary_weight,
+            tile_cls_weight=cfg.tile_cls_weight,
+            zoom_cls_weight=cfg.zoom_cls_weight,
             train=True,
             epoch=epoch,
             split_name="train",
+            collect_hard_scores=cfg.hard_negative_mining,
+            writer=writer,
+            global_step_start=train_global_step,
+            dataloader_verbose=cfg.dataloader_verbose,
         )
+        train_global_step += int(tr.get("num_steps", 0))
+        if cfg.hard_negative_mining:
+            train_ds.update_hard_negative_scores(tr.get("hard_scores", {}))
 
-        va = {"total_loss": float("nan"), "mask_iou": float("nan")}
+        va = {
+            "total_loss": float("nan"),
+            "mcc_loss": float("nan"),
+            "bce_loss": float("nan"),
+            "boundary_loss": float("nan"),
+            "tile_cls_loss": float("nan"),
+            "zoom_cls_loss": float("nan"),
+            "soft_iou": float("nan"),
+            "pos_iou": float("nan"),
+            "neg_fp_rate": float("nan"),
+            "mask_iou": float("nan"),
+        }
         if epoch % cfg.val_interval == 0:
             va = run_epoch(
                 model=model,
@@ -879,31 +1700,76 @@ def main() -> None:
                 optimizer=optimizer,
                 device=device,
                 iou_threshold=cfg.iou_threshold,
+                mcc_weight=epoch_mcc_weight,
+                bce_weight=cfg.bce_weight,
+                boundary_weight=cfg.boundary_weight,
+                tile_cls_weight=cfg.tile_cls_weight,
+                zoom_cls_weight=cfg.zoom_cls_weight,
                 train=False,
                 epoch=epoch,
                 split_name="val",
+                collect_hard_scores=False,
+                writer=writer,
+                global_step_start=val_global_step,
+                dataloader_verbose=cfg.dataloader_verbose,
             )
+            val_global_step += int(va.get("num_steps", 0))
 
         row = {
             "epoch": epoch,
             "train_total": tr["total_loss"],
-            "train_iou": tr["mask_iou"],
+            "train_tile_cls_loss": tr["tile_cls_loss"],
+            "train_zoom_cls_loss": tr["zoom_cls_loss"],
+            "train_iou": tr["soft_iou"],
+            "train_pos_iou": tr["pos_iou"],
+            "train_neg_fp_rate": tr["neg_fp_rate"],
             "val_total": va["total_loss"],
-            "val_iou": va["mask_iou"],
+            "val_tile_cls_loss": va["tile_cls_loss"],
+            "val_zoom_cls_loss": va["zoom_cls_loss"],
+            "val_iou": va["soft_iou"],
+            "val_pos_iou": va["pos_iou"],
+            "val_neg_fp_rate": va["neg_fp_rate"],
         }
         history.append(row)
 
         print(
             f"epoch={epoch:02d} "
-            f"train_total={row['train_total']:.4f} train_iou={row['train_iou']:.4f} "
-            f"val_total={row['val_total']:.4f} val_iou={row['val_iou']:.4f}"
+            f"lr={lr_now:.8f} "
+            f"mcc_w={epoch_mcc_weight:.4f} "
+            f"train_total={row['train_total']:.4f} train_tile_cls={row['train_tile_cls_loss']:.4f} "
+            f"train_zoom_cls={row['train_zoom_cls_loss']:.4f} "
+            f"train_iou={row['train_iou']:.4f} "
+            f"train_pos_iou={row['train_pos_iou']:.4f} train_neg_fp={row['train_neg_fp_rate']:.4f} "
+            f"val_total={row['val_total']:.4f} val_tile_cls={row['val_tile_cls_loss']:.4f} "
+            f"val_zoom_cls={row['val_zoom_cls_loss']:.4f} "
+            f"val_iou={row['val_iou']:.4f} "
+            f"val_pos_iou={row['val_pos_iou']:.4f} val_neg_fp={row['val_neg_fp_rate']:.4f}"
         )
 
-        writer.add_scalar("loss/train_total", row["train_total"], epoch)
+        writer.add_scalar("lr/epoch", lr_now, epoch)
+        writer.add_scalar("loss_cfg/mcc_weight", epoch_mcc_weight, epoch)
+        writer.add_scalar("metric/train_soft_iou", row["train_iou"], epoch)
+        writer.add_scalar("metric/train_pos_iou", row["train_pos_iou"], epoch)
+        writer.add_scalar("metric/train_neg_fp_rate", row["train_neg_fp_rate"], epoch)
+        if not math.isnan(row["train_tile_cls_loss"]):
+            writer.add_scalar("loss_epoch/train_tile_cls", row["train_tile_cls_loss"], epoch)
+        if not math.isnan(row["train_zoom_cls_loss"]):
+            writer.add_scalar("loss_epoch/train_zoom_cls", row["train_zoom_cls_loss"], epoch)
+        # Backward-compatible alias: mask_iou now reports soft_iou.
         writer.add_scalar("metric/train_mask_iou", row["train_iou"], epoch)
         if epoch % cfg.val_interval == 0:
-            writer.add_scalar("loss/val_total", row["val_total"], epoch)
+            writer.add_scalar("metric/val_soft_iou", row["val_iou"], epoch)
+            writer.add_scalar("metric/val_pos_iou", row["val_pos_iou"], epoch)
+            writer.add_scalar("metric/val_neg_fp_rate", row["val_neg_fp_rate"], epoch)
+            if not math.isnan(row["val_tile_cls_loss"]):
+                writer.add_scalar("loss_epoch/val_tile_cls", row["val_tile_cls_loss"], epoch)
+            if not math.isnan(row["val_zoom_cls_loss"]):
+                writer.add_scalar("loss_epoch/val_zoom_cls", row["val_zoom_cls_loss"], epoch)
+            # Backward-compatible alias: mask_iou now reports soft_iou.
             writer.add_scalar("metric/val_mask_iou", row["val_iou"], epoch)
+
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch % cfg.image_log_interval == 0:
             train_fig = make_sample_figure(
@@ -938,9 +1804,12 @@ def main() -> None:
                     "epoch": epoch,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
                     "history": history,
                     "cfg": asdict(cfg),
                     "best_val_iou": best_val_iou,
+                    "train_global_step": train_global_step,
+                    "val_global_step": val_global_step,
                 },
                 best_path,
             )
@@ -948,12 +1817,15 @@ def main() -> None:
     final_ckpt = ckpt_dir / "final.pt"
     torch.save(
         {
-            "epoch": cfg.epochs,
+            "epoch": target_end_epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "history": history,
             "cfg": asdict(cfg),
             "best_val_iou": best_val_iou,
+            "train_global_step": train_global_step,
+            "val_global_step": val_global_step,
         },
         final_ckpt,
     )

@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import shutil
+from copy import deepcopy
+from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+
+import torch
+from transformers import SamModel, SamProcessor
+
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+@dataclass
+class Record:
+    image_path: Path
+    json_path: Path
+    json_data: Dict
+    bbox_shape_indices: List[int]
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Convert LabelMe bbox annotations to polygons with batched SAM1")
+    ap.add_argument("--input-dir", type=Path, required=True, help="Folder with LabelMe image/json pairs")
+    ap.add_argument("--output-dir", type=Path, default=Path("data/sam_box_to_poly"))
+    ap.add_argument("--model-id", type=str, default="facebook/sam-vit-base")
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--image-batch-size", type=int, default=4, help="How many images per SAM forward pass")
+    ap.add_argument("--min-poly-area", type=float, default=20.0)
+    ap.add_argument("--poly-epsilon-frac", type=float, default=0.002)
+    ap.add_argument("--overwrite", action="store_true", default=False)
+    ap.add_argument("--max-images", type=int, default=0, help="0 means all")
+    ap.add_argument(
+        "--load-workers",
+        type=int,
+        default=8,
+        help="Workers for JSON/image pair discovery in load_records",
+    )
+    return ap.parse_args()
+
+
+def find_image_for_json(data_dir: Path, stem: str) -> Path | None:
+    for p in data_dir.glob(f"{stem}.*"):
+        if p.is_file() and p.suffix.lower() in IMG_EXTS:
+            return p
+    return None
+
+
+def _build_record(jf: Path, input_dir: Path) -> Record | None:
+    img_path = find_image_for_json(input_dir, jf.stem)
+    if img_path is None:
+        return None
+    try:
+        d = json.loads(jf.read_text())
+    except Exception:
+        return None
+    shapes = d.get("shapes", []) or []
+    bbox_idx: List[int] = []
+    for i, s in enumerate(shapes):
+        st = str(s.get("shape_type", "")).lower()
+        pts = s.get("points", []) or []
+        if st == "rectangle" and len(pts) >= 2:
+            bbox_idx.append(i)
+    return Record(image_path=img_path, json_path=jf, json_data=d, bbox_shape_indices=bbox_idx)
+
+
+def load_records(input_dir: Path, load_workers: int) -> List[Record]:
+    json_files = sorted(input_dir.glob("*.json"))
+    out: List[Record] = []
+    workers = max(1, int(load_workers))
+
+    if workers == 1:
+        for jf in tqdm(json_files, desc="load_records", leave=True):
+            rec = _build_record(jf, input_dir)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_build_record, jf, input_dir) for jf in json_files]
+        for fut in tqdm(futs, desc="load_records", leave=True):
+            rec = fut.result()
+            if rec is not None:
+                out.append(rec)
+    out.sort(key=lambda r: r.json_path.name)
+    return out
+
+
+def shape_rect_to_box_and_point(shape: Dict) -> Tuple[List[float], List[float]] | None:
+    pts = shape.get("points", []) or []
+    if len(pts) < 2:
+        return None
+    x0, y0 = float(pts[0][0]), float(pts[0][1])
+    x1, y1 = float(pts[1][0]), float(pts[1][1])
+    lx, rx = min(x0, x1), max(x0, x1)
+    ty, by = min(y0, y1), max(y0, y1)
+    if rx <= lx or by <= ty:
+        return None
+    box = [lx, ty, rx, by]
+    point = [0.5 * (lx + rx), 0.5 * (ty + by)]
+    return box, point
+
+
+def mask_to_polygons(mask_u8: np.ndarray, min_area: float, epsilon_frac: float) -> List[List[List[float]]]:
+    m = (mask_u8 > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    polys = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        eps = max(1.0, epsilon_frac * peri)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        pts = approx.reshape(-1, 2).astype(float)
+        if pts.shape[0] < 3:
+            continue
+        polys.append([[float(x), float(y)] for x, y in pts])
+    return polys
+
+
+def normalize_mask_candidates(mask_tensor: torch.Tensor, n_boxes: int) -> np.ndarray:
+    # target shape: (n_boxes, n_masks, H, W)
+    arr = mask_tensor.detach().cpu().numpy()
+    while arr.ndim > 4 and arr.shape[0] == 1:
+        arr = arr[0]
+
+    if arr.ndim == 3:
+        arr = arr[np.newaxis, ...]
+
+    if arr.ndim != 4:
+        raise RuntimeError(f"Unexpected mask tensor shape after squeeze: {arr.shape}")
+
+    if arr.shape[0] == n_boxes:
+        return arr
+    if arr.shape[1] == n_boxes:
+        return np.transpose(arr, (1, 0, 2, 3))
+
+    if n_boxes == 1 and arr.shape[0] != 1:
+        return arr[:1]
+    raise RuntimeError(f"Cannot align masks with boxes: arr={arr.shape}, n_boxes={n_boxes}")
+
+
+def normalize_scores(score_tensor: torch.Tensor, n_boxes: int) -> np.ndarray:
+    # target shape: (n_boxes, n_masks)
+    s = score_tensor.detach().cpu().numpy()
+    while s.ndim > 2 and s.shape[0] == 1:
+        s = s[0]
+
+    if s.ndim == 1:
+        s = s[np.newaxis, ...]
+
+    if s.ndim != 2:
+        raise RuntimeError(f"Unexpected score tensor shape after squeeze: {s.shape}")
+
+    if s.shape[0] == n_boxes:
+        return s
+    if s.shape[1] == n_boxes:
+        return s.T
+
+    if n_boxes == 1 and s.shape[0] != 1:
+        return s[:1]
+    raise RuntimeError(f"Cannot align scores with boxes: score={s.shape}, n_boxes={n_boxes}")
+
+
+def chunked(seq: List, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def main() -> None:
+    args = parse_args()
+
+    if not args.input_dir.exists():
+        raise FileNotFoundError(f"Missing input dir: {args.input_dir}")
+
+    if args.output_dir.exists():
+        if args.overwrite:
+            shutil.rmtree(args.output_dir)
+        else:
+            raise FileExistsError(f"Output dir exists: {args.output_dir}. Use --overwrite.")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device(args.device)
+    print(f"Loading SAM: {args.model_id} on {device}")
+    processor = SamProcessor.from_pretrained(args.model_id)
+    sam = SamModel.from_pretrained(args.model_id).to(device).eval()
+
+    records = load_records(args.input_dir, args.load_workers)
+    if args.max_images > 0:
+        records = records[: args.max_images]
+
+    print(f"records_total={len(records)}")
+    print(f"image_batch_size={args.image_batch_size}")
+
+    written = 0
+    total_rects = 0
+    converted_rects = 0
+    fallback_rects = 0
+
+    # Process images in batches; each image can have variable number of boxes.
+    for batch in tqdm(list(chunked(records, args.image_batch_size)), desc="SAM batched bbox->poly"):
+        # Build SAM inputs for images that actually have bbox shapes.
+        batch_images: List[Image.Image] = []
+        batch_boxes: List[List[List[float]]] = []
+        batch_records: List[Record] = []
+        batch_shape_indices: List[List[int]] = []
+        batch_true_box_counts: List[int] = []
+
+        for rec in batch:
+            img = Image.open(rec.image_path).convert("RGB")
+            boxes_i = []
+            shape_idx_i = []
+
+            for si in rec.bbox_shape_indices:
+                shape = rec.json_data.get("shapes", [])[si]
+                bp = shape_rect_to_box_and_point(shape)
+                if bp is None:
+                    continue
+                box, _ = bp
+                boxes_i.append(box)
+                shape_idx_i.append(si)
+
+            total_rects += len(rec.bbox_shape_indices)
+
+            if len(boxes_i) == 0:
+                # No usable boxes: directly copy with original json/image.
+                out_img = args.output_dir / rec.image_path.name
+                out_json = args.output_dir / rec.json_path.name
+                shutil.copy2(rec.image_path, out_img)
+                out_json.write_text(json.dumps(rec.json_data, ensure_ascii=False, indent=2))
+                written += 1
+                continue
+
+            batch_images.append(img)
+            batch_boxes.append(boxes_i)
+            batch_records.append(rec)
+            batch_shape_indices.append(shape_idx_i)
+            batch_true_box_counts.append(len(boxes_i))
+
+        if len(batch_images) == 0:
+            continue
+
+        # SamProcessor expects a rectangular [B, N, 4] array for boxes.
+        # Pad each image's box list to the same N inside this batch.
+        max_boxes = max(batch_true_box_counts)
+        padded_batch_boxes: List[List[List[float]]] = []
+        for boxes_i in batch_boxes:
+            if len(boxes_i) < max_boxes:
+                pad_box = boxes_i[-1]
+                boxes_i = boxes_i + [pad_box] * (max_boxes - len(boxes_i))
+            padded_batch_boxes.append(boxes_i)
+
+        inputs = processor(
+            images=batch_images,
+            input_boxes=padded_batch_boxes,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            out = sam(**inputs, multimask_output=True)
+
+        post_masks = processor.image_processor.post_process_masks(
+            out.pred_masks.detach().cpu(),
+            inputs["original_sizes"].detach().cpu(),
+            inputs["reshaped_input_sizes"].detach().cpu(),
+        )
+
+        # Build converted outputs per image in the batch.
+        for bi, rec in enumerate(batch_records):
+            n_boxes = int(batch_true_box_counts[bi])
+
+            masks_all = normalize_mask_candidates(post_masks[bi], n_boxes=max_boxes)
+            scores_all = normalize_scores(out.iou_scores[bi], n_boxes=max_boxes)
+            masks_i = masks_all[:n_boxes]
+            scores_i = scores_all[:n_boxes]
+
+            d_new = deepcopy(rec.json_data)
+            repl: Dict[int, List[Dict]] = {}
+
+            for j in range(n_boxes):
+                best_idx = int(np.argmax(scores_i[j]))
+                best_mask = (masks_i[j, best_idx] > 0).astype(np.uint8)
+                polys = mask_to_polygons(best_mask, min_area=args.min_poly_area, epsilon_frac=args.poly_epsilon_frac)
+
+                si = batch_shape_indices[bi][j]
+                src_shape = d_new["shapes"][si]
+                label = src_shape.get("label", "vehicle")
+                flags = src_shape.get("flags", {}) or {}
+
+                if len(polys) == 0:
+                    fallback_rects += 1
+                    repl[si] = [src_shape]
+                    continue
+
+                converted_rects += 1
+                ns = []
+                for poly in polys:
+                    ns.append(
+                        {
+                            "label": label,
+                            "points": poly,
+                            "group_id": src_shape.get("group_id"),
+                            "shape_type": "polygon",
+                            "flags": {**flags, "source": "sam1_box_to_poly"},
+                        }
+                    )
+                repl[si] = ns
+
+            # Rebuild shape list preserving order for unchanged entries.
+            final_shapes: List[Dict] = []
+            for si, s in enumerate(d_new.get("shapes", [])):
+                if si in repl:
+                    final_shapes.extend(repl[si])
+                else:
+                    final_shapes.append(s)
+
+            d_new["shapes"] = final_shapes
+
+            out_img = args.output_dir / rec.image_path.name
+            out_json = args.output_dir / rec.json_path.name
+            shutil.copy2(rec.image_path, out_img)
+            out_json.write_text(json.dumps(d_new, ensure_ascii=False, indent=2))
+            written += 1
+
+    print("done")
+    print(f"output_dir={args.output_dir}")
+    print(f"records_written={written}")
+    print(f"rectangles_total={total_rects}")
+    print(f"rectangles_converted={converted_rects}")
+    print(f"rectangles_fallback={fallback_rects}")
+
+
+if __name__ == "__main__":
+    main()
