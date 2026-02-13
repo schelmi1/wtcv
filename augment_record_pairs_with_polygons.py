@@ -14,9 +14,12 @@ import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
 
-
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".webp"}
-
+from wtcv_utils.labelme import (
+    polygon_area,
+    polygon_bbox,
+    shape_to_points,
+)
+from wtcv_utils.records import load_labelme_pairs
 
 @dataclass
 class TargetRecord:
@@ -85,48 +88,20 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def find_image_for_json(data_dir: Path, stem: str) -> Optional[Path]:
-    cands = [p for p in data_dir.glob(f"{stem}.*") if p.is_file() and p.suffix.lower() in IMG_EXTS]
-    if not cands:
-        return None
-    cands.sort(key=lambda p: p.name)
-    return cands[0]
-
-
-def polygon_area(points: List[List[float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-    x = np.array([p[0] for p in points], dtype=np.float32)
-    y = np.array([p[1] for p in points], dtype=np.float32)
-    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
-def polygon_bbox(points: List[List[float]]) -> Tuple[float, float, float, float]:
-    xs = [float(p[0]) for p in points]
-    ys = [float(p[1]) for p in points]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def shape_to_points(shape: Dict) -> List[List[float]]:
-    st = str(shape.get("shape_type", "")).lower()
-    pts = shape.get("points", []) or []
-    if st == "rectangle" and len(pts) >= 2:
-        x0, y0 = pts[0]
-        x1, y1 = pts[1]
-        lx, rx = min(float(x0), float(x1)), max(float(x0), float(x1))
-        ty, by = min(float(y0), float(y1)), max(float(y0), float(y1))
-        return [[lx, ty], [rx, ty], [rx, by], [lx, by]]
-    return [[float(p[0]), float(p[1])] for p in pts]
-
-
-def load_target_records(data_dir: Path, label: str) -> List[TargetRecord]:
+def load_target_records(data_dir: Path, label: str, max_images: int = 0, load_workers: int = 8) -> List[TargetRecord]:
     label_cf = label.strip().casefold()
     recs: List[TargetRecord] = []
-    for jf in tqdm(sorted(data_dir.glob("*.json")), desc="load_target_records", leave=True):
-        ip = find_image_for_json(data_dir, jf.stem)
-        if ip is None:
-            continue
-        d = json.loads(jf.read_text())
+    pairs = load_labelme_pairs(
+        data_dir,
+        load_workers=load_workers,
+        max_images=max_images,
+        progress_desc="load_target_records",
+        progress_leave=True,
+    )
+    for pair in pairs:
+        jf = pair.json_path
+        ip = pair.image_path
+        d = pair.json_data
         w = int(d.get("imageWidth", 0) or 0)
         h = int(d.get("imageHeight", 0) or 0)
         if w <= 0 or h <= 0:
@@ -136,7 +111,9 @@ def load_target_records(data_dir: Path, label: str) -> List[TargetRecord]:
         for s in d.get("shapes", []) or []:
             if str(s.get("label", "")).strip().casefold() != label_cf:
                 continue
-            pts = shape_to_points(s)
+            pts = shape_to_points(s, min_poly_points=3)
+            if pts is None:
+                continue
             if len(pts) < 3:
                 continue
             a = polygon_area(pts)
@@ -176,33 +153,37 @@ def build_donor_pool(
     min_poly_area: float,
     donor_max_images: int = 0,
     sample_seed: int = 42,
+    load_workers: int = 8,
 ) -> List[DonorObject]:
     label_cf = label.strip().casefold()
     pool: List[DonorObject] = []
-    donor_jsons = sorted(data_dir.glob("*.json"))
-    if donor_max_images > 0:
-        r = random.Random(sample_seed)
-        if donor_max_images < len(donor_jsons):
-            donor_jsons = r.sample(donor_jsons, donor_max_images)
-        else:
-            r.shuffle(donor_jsons)
+    pairs = load_labelme_pairs(
+        data_dir,
+        load_workers=load_workers,
+        max_images=donor_max_images,
+        random_sample=True,
+        sample_seed=sample_seed,
+        progress_desc="build_donor_pool",
+        progress_leave=True,
+    )
 
-    for jf in tqdm(donor_jsons, desc="build_donor_pool", leave=True):
-        ip = find_image_for_json(data_dir, jf.stem)
-        if ip is None:
-            continue
+    for pair in pairs:
+        jf = pair.json_path
+        ip = pair.image_path
         img_bgr = cv2.imread(str(ip), cv2.IMREAD_COLOR)
         if img_bgr is None:
             continue
 
-        d = json.loads(jf.read_text())
+        d = pair.json_data
         h, w = img_bgr.shape[:2]
         best: Optional[DonorObject] = None
 
         for s in d.get("shapes", []) or []:
             if str(s.get("label", "")).strip().casefold() != label_cf:
                 continue
-            pts = shape_to_points(s)
+            pts = shape_to_points(s, min_poly_points=3)
+            if pts is None:
+                continue
             if len(pts) < 3:
                 continue
 
@@ -330,9 +311,12 @@ def main() -> None:
             raise FileExistsError(f"Output exists: {args.output_dir}. Use --overwrite")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    target_recs = load_target_records(args.target_dir, args.target_label)
-    if args.max_images > 0:
-        target_recs = target_recs[: args.max_images]
+    target_recs = load_target_records(
+        args.target_dir,
+        args.target_label,
+        max_images=args.max_images,
+        load_workers=8,
+    )
 
     if len(target_recs) == 0:
         raise RuntimeError("No target records found")
@@ -343,6 +327,7 @@ def main() -> None:
         min_poly_area=args.min_poly_area,
         donor_max_images=args.donor_max_images,
         sample_seed=args.seed,
+        load_workers=8,
     )
     if len(donor_pool) == 0:
         raise RuntimeError("No donor polygon objects found")

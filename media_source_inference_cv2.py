@@ -22,9 +22,9 @@ from curate_model_predictions_to_labelme import (
     make_labelme_json,
     mask_to_polygons,
 )
+from wtcv_utils.labelme import IMG_EXTS
 
 
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".webp"}
 VID_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 

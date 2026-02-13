@@ -15,7 +15,8 @@ import torch.nn.functional as F
 import torchvision
 from torchvision.transforms import functional as TF
 
-from train_stage1_seg import Stage1SegNet, tile_origins, crop_with_pad
+from models import Stage1SegNet
+from wtcv_utils.tiling import crop_with_pad, tile_origins
 
 
 def parse_args() -> argparse.Namespace:

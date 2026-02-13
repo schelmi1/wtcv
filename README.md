@@ -2,6 +2,36 @@
 
 War Thunder computer vision workspace for small-object vehicle segmentation with tiled inference.
 
+## Codebase Map (Refactor Pass)
+
+Shared utilities now live in:
+- `wtcv_utils/labelme.py`
+  - `IMG_EXTS`
+  - `find_image_for_json(...)`
+  - `shape_to_points(...)` (rectangle + polygon handling)
+  - `polygon_area(...)`, `polygon_bbox(...)`
+  - label casefold/match helpers
+- `wtcv_utils/records.py`
+  - `load_labelme_pairs(...)` (shared fast/multiprocess LabelMe pair loader)
+  - `load_labelme_records(...)`
+  - `discover_labels(...)`
+- `wtcv_utils/tiling.py`
+  - `tile_origins(...)`
+  - `crop_with_pad(...)`
+
+Scripts migrated to use these shared helpers:
+- `wtcv_gradio_app.py`
+- `augment_record_pairs_with_polygons.py`
+- `sam1_box_to_poly_batched.py`
+- `fiftyone_object_umap.py`
+- `fiftyone_export_tagged_to_labelme.py`
+- `media_source_inference_cv2.py`
+- `train_stage1_seg.py`
+- `eval_stage1_seg.py`
+- `curate_model_predictions_to_labelme.py`
+
+This reduces duplicated geometry/path logic and keeps app + data tools consistent.
+
 ## WTCV Studio (Gradio App)
 
 Script: `wtcv_gradio_app.py`
@@ -137,6 +167,7 @@ python sam1_box_to_poly_batched.py \
 
 Common args:
 - `--input-dir`: LabelMe pairs with rectangle shapes.
+- `--prompt-mode {bbox,point}`: bbox prompts or center-of-gravity point prompts (for polygon datasets).
 - `--output-dir`: converted pairs destination.
 - `--model-id`: HF SAM model id (default `facebook/sam-vit-base`).
 - `--device`: `cuda` or `cpu`.
@@ -173,6 +204,7 @@ Common args:
 - `--min-pastes-per-image`, `--max-pastes-per-image`.
 - `--size-min-ratio`, `--size-max-ratio`: pasted object area ratio limits.
 - `--placement-horizon-frac`, `--max-overlap-iou`, `--max-placement-tries`.
+- `--poly-epsilon-frac`: polygon simplification for pasted masks (`0` keeps raw contours).
 - `--occlusion-prob`, `--feather-radius`, JPEG quality args.
 
 ---

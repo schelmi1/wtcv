@@ -3,3 +3,4 @@ outputs/
 runs/
 __pycache__
 videos/
+*.ipynb

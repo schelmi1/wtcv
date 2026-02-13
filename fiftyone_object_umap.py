@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -19,7 +18,10 @@ from torchvision.transforms import functional as TF
 try:
     import umap  # type: ignore
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("Missing dependency `umap-learn`. Install with: pip install umap-learn") from e
+    raise RuntimeError(
+        "Failed to import `umap-learn` (install with `pip install umap-learn`, "
+        "and verify numba cache/runtime is healthy)."
+    ) from e
 
 try:
     from sklearn.cluster import KMeans
@@ -35,8 +37,8 @@ try:
 except Exception as e:  # pragma: no cover
     raise RuntimeError("Missing dependency `fiftyone-brain`. Install with: pip install fiftyone-brain") from e
 
-
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".webp")
+from wtcv_utils.labelme import polygon_area, polygon_bbox, shape_to_points
+from wtcv_utils.records import load_labelme_pairs
 
 
 @dataclass
@@ -88,48 +90,6 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def polygon_bbox(points: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
-    xs = [float(p[0]) for p in points]
-    ys = [float(p[1]) for p in points]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def polygon_area(points: Sequence[Sequence[float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-    x = np.array([float(p[0]) for p in points], dtype=np.float32)
-    y = np.array([float(p[1]) for p in points], dtype=np.float32)
-    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
-def shape_to_points(shape: Dict, min_poly_points: int) -> Optional[List[List[float]]]:
-    st = str(shape.get("shape_type", "")).lower().strip()
-    pts = shape.get("points", []) or []
-    if st == "rectangle":
-        if len(pts) < 2:
-            return None
-        x0, y0 = float(pts[0][0]), float(pts[0][1])
-        x1, y1 = float(pts[1][0]), float(pts[1][1])
-        lx, rx = min(x0, x1), max(x0, x1)
-        ty, by = min(y0, y1), max(y0, y1)
-        return [[lx, ty], [rx, ty], [rx, by], [lx, by]]
-    if len(pts) < min_poly_points:
-        return None
-    return [[float(p[0]), float(p[1])] for p in pts]
-
-
-def find_image_for_json(data_dir: Path, stem: str) -> Optional[Path]:
-    cands = []
-    for p in data_dir.glob(f"{stem}.*"):
-        if p.is_file() and p.suffix.lower() in IMG_EXTS:
-            cands.append(p)
-    if not cands:
-        return None
-    pref = {e: i for i, e in enumerate(IMG_EXTS)}
-    cands.sort(key=lambda p: pref.get(p.suffix.lower(), 999))
-    return cands[0]
-
-
 def square_crop_with_pad(img_rgb: np.ndarray, x0: int, y0: int, side: int) -> np.ndarray:
     h, w = img_rgb.shape[:2]
     x1, y1 = x0 + side, y0 + side
@@ -165,15 +125,16 @@ def build_object_crops(
 
     label_set = {str(x).strip().casefold() for x in label_filter if str(x).strip()}
     metas: List[ObjMeta] = []
-    jfs = sorted(input_dir.glob("*.json"))
-    for jf in tqdm(jfs, desc="scan labelme"):
-        ip = find_image_for_json(input_dir, jf.stem)
-        if ip is None:
-            continue
-        try:
-            d = json.loads(jf.read_text())
-        except Exception:
-            continue
+    pairs = load_labelme_pairs(
+        input_dir,
+        load_workers=8,
+        progress_desc="scan labelme",
+        progress_leave=True,
+    )
+    for pair in pairs:
+        jf = pair.json_path
+        ip = pair.image_path
+        d = pair.json_data
 
         try:
             img = np.array(Image.open(ip).convert("RGB"), dtype=np.uint8)

@@ -16,6 +16,8 @@ try:
 except Exception as e:  # pragma: no cover
     raise RuntimeError("Missing dependency `fiftyone`. Install with: pip install fiftyone") from e
 
+from wtcv_utils.labelme import shape_to_points
+
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Export tagged FiftyOne object samples back to merged LabelMe image/json pairs")
@@ -25,22 +27,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--overwrite", action="store_true", default=True)
     ap.add_argument("--no-overwrite", action="store_false", dest="overwrite")
     return ap.parse_args()
-
-
-def shape_to_points(shape: Dict) -> Optional[List[List[float]]]:
-    st = str(shape.get("shape_type", "")).strip().lower()
-    pts = shape.get("points", []) or []
-    if st == "rectangle":
-        if len(pts) < 2:
-            return None
-        x0, y0 = float(pts[0][0]), float(pts[0][1])
-        x1, y1 = float(pts[1][0]), float(pts[1][1])
-        lx, rx = min(x0, x1), max(x0, x1)
-        ty, by = min(y0, y1), max(y0, y1)
-        return [[lx, ty], [rx, ty], [rx, by], [lx, by]]
-    if len(pts) < 3:
-        return None
-    return [[float(p[0]), float(p[1])] for p in pts]
 
 
 def stable_image_name(src_path: Path) -> str:
@@ -72,7 +58,7 @@ def read_points_from_source_json(source_json: Path, source_obj_idx: int) -> Opti
     shapes = d.get("shapes", []) or []
     if source_obj_idx < 0 or source_obj_idx >= len(shapes):
         return None
-    return shape_to_points(shapes[source_obj_idx])
+    return shape_to_points(shapes[source_obj_idx], min_poly_points=3)
 
 
 def main() -> None:
@@ -135,7 +121,7 @@ def main() -> None:
             if source_obj_idx < 0 or source_obj_idx >= len(shapes):
                 skipped_invalid += 1
                 continue
-            points = shape_to_points(shapes[source_obj_idx])
+            points = shape_to_points(shapes[source_obj_idx], min_poly_points=3)
         if points is None or len(points) < 3:
             skipped_invalid += 1
             continue

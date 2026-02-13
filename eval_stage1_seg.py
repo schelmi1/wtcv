@@ -16,7 +16,9 @@ import torchvision
 from torchvision.transforms import functional as TF
 from tqdm.auto import tqdm
 
-from train_stage1_seg import Stage1SegNet, load_records, tile_origins, crop_with_pad
+from models import Stage1SegNet
+from wtcv_utils.records import load_labelme_records
+from wtcv_utils.tiling import crop_with_pad, tile_origins
 
 
 @dataclass
@@ -325,7 +327,12 @@ def main() -> None:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    records = load_records(cfg.data_dir, cfg.label_name, cfg.min_poly_points)
+    records = load_labelme_records(
+        cfg.data_dir,
+        cfg.label_name,
+        cfg.min_poly_points,
+        load_workers=cfg.num_workers,
+    )
     if len(records) == 0:
         raise RuntimeError("No records found")
     eval_ds = EvalImageDataset(records)

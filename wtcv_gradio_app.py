@@ -33,10 +33,14 @@ from curate_model_predictions_to_labelme import (
     make_labelme_json,
     mask_to_polygons,
 )
+from wtcv_utils.labelme import (
+    polygon_area as _polygon_area,
+    shape_to_points as _shape_to_points,
+)
+from wtcv_utils.records import load_labelme_pairs
 
 
 ROOT = Path(__file__).resolve().parent
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".webp"}
 MAX_LOG_CHARS = 250_000
 
 THEME_INIT_JS = r"""
@@ -115,33 +119,6 @@ class CachedModel:
 
 
 _MODEL_CACHE: Dict[str, CachedModel] = {}
-
-
-def _find_image_for_json(data_dir: Path, stem: str) -> Optional[Path]:
-    for p in data_dir.glob(f"{stem}.*"):
-        if p.is_file() and p.suffix.lower() in IMG_EXTS:
-            return p
-    return None
-
-
-def _shape_to_points(shape: Dict) -> List[List[float]]:
-    st = str(shape.get("shape_type", "")).lower()
-    pts = shape.get("points", []) or []
-    if st == "rectangle" and len(pts) >= 2:
-        x0, y0 = pts[0]
-        x1, y1 = pts[1]
-        lx, rx = min(float(x0), float(x1)), max(float(x0), float(x1))
-        ty, by = min(float(y0), float(y1)), max(float(y0), float(y1))
-        return [[lx, ty], [rx, ty], [rx, by], [lx, by]]
-    return [[float(p[0]), float(p[1])] for p in pts]
-
-
-def _polygon_area(points: List[List[float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-    x = np.array([p[0] for p in points], dtype=np.float32)
-    y = np.array([p[1] for p in points], dtype=np.float32)
-    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
 
 
 def _draw_polygons(image_bgr: np.ndarray, polys: List[List[List[float]]], color: Tuple[int, int, int]) -> np.ndarray:
@@ -985,9 +962,15 @@ def dataset_peek(
         return f"Missing dataset dir: {dd}", []
 
     rng = random.Random(int(seed))
-    jfs = sorted(dd.glob("*.json"))
-    if int(max_images) > 0 and int(max_images) < len(jfs):
-        jfs = rng.sample(jfs, int(max_images))
+    pairs = load_labelme_pairs(
+        dd,
+        load_workers=8,
+        max_images=int(max_images),
+        random_sample=bool(int(max_images) > 0),
+        sample_seed=int(seed),
+        progress_desc="dataset_peek",
+        progress_leave=False,
+    )
 
     label_cf = label.strip().casefold()
     n_images = 0
@@ -995,14 +978,9 @@ def dataset_peek(
     ratios: List[float] = []
     labels_seen = set()
 
-    for jf in jfs:
-        ip = _find_image_for_json(dd, jf.stem)
-        if ip is None:
-            continue
-        try:
-            d = json.loads(jf.read_text())
-        except Exception:
-            continue
+    for pair in pairs:
+        ip = pair.image_path
+        d = pair.json_data
         w = int(d.get("imageWidth", 0) or 0)
         h = int(d.get("imageHeight", 0) or 0)
         if w <= 0 or h <= 0:
@@ -1019,7 +997,9 @@ def dataset_peek(
             labels_seen.add(str(s.get("label", "")))
             if str(s.get("label", "")).strip().casefold() != label_cf:
                 continue
-            pts = _shape_to_points(s)
+            pts = _shape_to_points(s, min_poly_points=3)
+            if pts is None:
+                continue
             a = _polygon_area(pts)
             if a <= 0:
                 continue
@@ -1048,18 +1028,13 @@ def dataset_peek(
 
     # Build random visualization samples.
     gallery: List[Tuple[np.ndarray, str]] = []
-    sample_jfs = sorted(dd.glob("*.json"))
-    rng.shuffle(sample_jfs)
-    for jf in sample_jfs:
+    sample_pairs = list(pairs)
+    rng.shuffle(sample_pairs)
+    for pair in sample_pairs:
         if len(gallery) >= int(sample_count):
             break
-        ip = _find_image_for_json(dd, jf.stem)
-        if ip is None:
-            continue
-        try:
-            d = json.loads(jf.read_text())
-        except Exception:
-            continue
+        ip = pair.image_path
+        d = pair.json_data
         img_bgr = cv2.imread(str(ip), cv2.IMREAD_COLOR)
         if img_bgr is None:
             continue
@@ -1067,7 +1042,9 @@ def dataset_peek(
         for s in d.get("shapes", []) or []:
             if str(s.get("label", "")).strip().casefold() != label_cf:
                 continue
-            pts = _shape_to_points(s)
+            pts = _shape_to_points(s, min_poly_points=3)
+            if pts is None:
+                continue
             if len(pts) >= 3:
                 polys.append(pts)
         if not polys:

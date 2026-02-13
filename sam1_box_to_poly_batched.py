@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import shutil
+import json
 from copy import deepcopy
 from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Tuple
+
 
 import cv2
 import numpy as np
@@ -16,9 +16,7 @@ from tqdm.auto import tqdm
 import torch
 from transformers import SamModel, SamProcessor
 
-
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".webp"}
-
+from wtcv_utils.records import LabelmePair, load_labelme_pairs
 
 @dataclass
 class Record:
@@ -50,21 +48,8 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def find_image_for_json(data_dir: Path, stem: str) -> Path | None:
-    for p in data_dir.glob(f"{stem}.*"):
-        if p.is_file() and p.suffix.lower() in IMG_EXTS:
-            return p
-    return None
-
-
-def _build_record(jf: Path, input_dir: Path) -> Record | None:
-    img_path = find_image_for_json(input_dir, jf.stem)
-    if img_path is None:
-        return None
-    try:
-        d = json.loads(jf.read_text())
-    except Exception:
-        return None
+def _build_record_from_pair(pair: LabelmePair) -> Record:
+    d = pair.json_data
     shapes = d.get("shapes", []) or []
     bbox_idx: List[int] = []
     point_idx: List[int] = []
@@ -76,34 +61,23 @@ def _build_record(jf: Path, input_dir: Path) -> Record | None:
         elif len(pts) >= 3:
             point_idx.append(i)
     return Record(
-        image_path=img_path,
-        json_path=jf,
+        image_path=pair.image_path,
+        json_path=pair.json_path,
         json_data=d,
         bbox_shape_indices=bbox_idx,
         point_shape_indices=point_idx,
     )
 
 
-def load_records(input_dir: Path, load_workers: int) -> List[Record]:
-    json_files = sorted(input_dir.glob("*.json"))
-    out: List[Record] = []
-    workers = max(1, int(load_workers))
-
-    if workers == 1:
-        for jf in tqdm(json_files, desc="load_records", leave=True):
-            rec = _build_record(jf, input_dir)
-            if rec is not None:
-                out.append(rec)
-        return out
-
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_build_record, jf, input_dir) for jf in json_files]
-        for fut in tqdm(futs, desc="load_records", leave=True):
-            rec = fut.result()
-            if rec is not None:
-                out.append(rec)
-    out.sort(key=lambda r: r.json_path.name)
-    return out
+def load_records(input_dir: Path, load_workers: int, max_images: int = 0) -> List[Record]:
+    pairs = load_labelme_pairs(
+        input_dir,
+        load_workers=load_workers,
+        max_images=max_images,
+        progress_desc="load_records",
+        progress_leave=True,
+    )
+    return [_build_record_from_pair(p) for p in pairs]
 
 
 def shape_rect_to_box_and_point(shape: Dict) -> Tuple[List[float], List[float]] | None:
@@ -242,9 +216,7 @@ def main() -> None:
     processor = SamProcessor.from_pretrained(args.model_id)
     sam = SamModel.from_pretrained(args.model_id).to(device).eval()
 
-    records = load_records(args.input_dir, args.load_workers)
-    if args.max_images > 0:
-        records = records[: args.max_images]
+    records = load_records(args.input_dir, args.load_workers, max_images=args.max_images)
 
     print(f"records_total={len(records)}")
     print(f"image_batch_size={args.image_batch_size}")
