@@ -33,6 +33,29 @@ except Exception:
     ImageGrab = None
 
 
+def ensure_cv2_highgui() -> None:
+    missing = []
+    if not hasattr(cv2, "namedWindow"):
+        missing.append("namedWindow")
+    if not hasattr(cv2, "imshow"):
+        missing.append("imshow")
+    if not hasattr(cv2, "waitKey"):
+        missing.append("waitKey")
+    if not hasattr(cv2, "destroyAllWindows"):
+        missing.append("destroyAllWindows")
+    if not missing:
+        return
+    cv2_file = getattr(cv2, "__file__", None)
+    raise RuntimeError(
+        "OpenCV HighGUI is not available in this environment. "
+        f"missing={missing} cv2.__file__={cv2_file}. "
+        "This usually means opencv-python-headless is installed, or the cv2 package is corrupted. "
+        "Fix by reinstalling GUI OpenCV in your active env: "
+        "`python -m pip uninstall -y opencv-python-headless opencv-contrib-python-headless opencv-python opencv-contrib-python` "
+        "then `python -m pip install --no-cache-dir opencv-python`."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Live screen inference with OpenCV UI")
     ap.add_argument("--checkpoint", type=Path, required=True)
@@ -447,6 +470,7 @@ def compute_zoom_scores_for_polys(
 
 
 def main() -> None:
+    ensure_cv2_highgui()
     args = parse_args()
     if args.print_monitors:
         ScreenGrabber.print_monitors()

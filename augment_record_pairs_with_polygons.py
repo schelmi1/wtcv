@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--size-min-ratio", type=float, default=0.0001)
     ap.add_argument("--size-max-ratio", type=float, default=0.05)
     ap.add_argument("--min-poly-area", type=float, default=12.0)
+    ap.add_argument(
+        "--poly-epsilon-frac",
+        type=float,
+        default=0.0,
+        help="Contour simplification epsilon fraction for pasted-mask polygons (0 keeps raw contour)",
+    )
 
     ap.add_argument("--feather-radius", type=int, default=3)
     ap.add_argument("--jpeg-quality-min", type=int, default=55)
@@ -143,18 +149,21 @@ def load_target_records(data_dir: Path, label: str) -> List[TargetRecord]:
     return recs
 
 
-def mask_to_polygons(mask_u8: np.ndarray, min_area: float, epsilon_frac: float = 0.002) -> List[List[List[float]]]:
+def mask_to_polygons(mask_u8: np.ndarray, min_area: float, epsilon_frac: float = 0.0) -> List[List[List[float]]]:
     m = (mask_u8 > 0).astype(np.uint8)
-    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     polys: List[List[List[float]]] = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
-        peri = cv2.arcLength(cnt, True)
-        eps = max(1.0, epsilon_frac * peri)
-        approx = cv2.approxPolyDP(cnt, eps, True)
-        pts = approx.reshape(-1, 2).astype(float)
+        if epsilon_frac > 0.0:
+            peri = cv2.arcLength(cnt, True)
+            eps = float(epsilon_frac) * peri
+            approx = cv2.approxPolyDP(cnt, eps, True)
+            pts = approx.reshape(-1, 2).astype(float)
+        else:
+            pts = cnt.reshape(-1, 2).astype(float)
         if pts.shape[0] < 3:
             continue
         polys.append([[float(x), float(y)] for x, y in pts])
@@ -435,7 +444,11 @@ def main() -> None:
                     m_work[oy:oy + occ_h, ox:ox + occ_w] = 0
 
                 # Convert pasted mask to polygon(s) in global coords.
-                polys_local = mask_to_polygons(m_work, min_area=args.min_poly_area)
+                polys_local = mask_to_polygons(
+                    m_work,
+                    min_area=args.min_poly_area,
+                    epsilon_frac=float(args.poly_epsilon_frac),
+                )
                 if len(polys_local) == 0:
                     placed = True
                     existing_boxes.append(cand_box)

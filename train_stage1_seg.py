@@ -41,6 +41,7 @@ class Cfg:
     tile_scales: str = "1.0"
 
     label_name: str = "vehicle"
+    fp_label: str = "fp"
     min_poly_points: int = 3
 
     seg_out_stride: int = 4
@@ -62,6 +63,9 @@ class Cfg:
     tile_cls_weight: float = 0.3
     use_zoom_cls_head: bool = True
     zoom_cls_weight: float = 0.2
+    use_fp_supervision: bool = True
+    fp_neg_weight: float = 0.3
+    fp_neg_ratio: float = 0.5
 
     balance_train_50_50: bool = True
     balance_val_50_50: bool = True
@@ -134,9 +138,16 @@ def polygon_center(points: List[List[float]]) -> Tuple[float, float]:
     return float(np.mean(xs)), float(np.mean(ys))
 
 
-def load_records(data_dir: Path, label_name: str, min_poly_points: int) -> List[Dict]:
+def load_records(
+    data_dir: Path,
+    label_name: str,
+    min_poly_points: int,
+    include_fp: bool = False,
+    fp_label: str = "fp",
+) -> List[Dict]:
     allowed_exts = (".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff")
     wanted_label = str(label_name).strip().casefold()
+    fp_label_cf = str(fp_label).strip().casefold()
     records = []
     for jf in sorted(data_dir.glob("*.json")):
         # Resolve image file by shared stem across common extensions.
@@ -159,7 +170,9 @@ def load_records(data_dir: Path, label_name: str, min_poly_points: int) -> List[
         objects = []
         for s in shapes:
             got_label = str(s.get("label", "")).strip().casefold()
-            if got_label != wanted_label:
+            is_pos = (got_label == wanted_label)
+            is_fp = include_fp and (got_label == fp_label_cf) and (got_label != wanted_label)
+            if (not is_pos) and (not is_fp):
                 continue
             pts = s.get("points") or []
             stype = str(s.get("shape_type", "")).lower()
@@ -177,6 +190,8 @@ def load_records(data_dir: Path, label_name: str, min_poly_points: int) -> List[
                 pa = polygon_area(pts)
             objects.append(
                 {
+                    "label_cf": got_label,
+                    "is_fp": bool(is_fp),
                     "points": pts,
                     "shape_type": stype if stype else "polygon",
                     "bbox_xyxy": [x0, y0, x1, y1],
@@ -267,6 +282,8 @@ def objects_in_tile(objs: List[Dict], x0: int, y0: int, size: int) -> List[Dict]
             spts.append([px, py])
         out.append(
             {
+                "label_cf": str(o.get("label_cf", "")),
+                "is_fp": bool(o.get("is_fp", False)),
                 "bbox_xyxy": [sbx0, sby0, sbx1, sby1],
                 "points": spts,
                 "shape_type": o.get("shape_type", "polygon"),
@@ -305,6 +322,7 @@ class SegTileDataset(Dataset):
         seg_out_stride: int,
         seed: int,
         balance_50_50: bool,
+        fp_neg_ratio: float = 0.5,
         augment_low_vis: bool = False,
         is_train: bool = False,
         dataset_name: str = "dataset",
@@ -315,6 +333,7 @@ class SegTileDataset(Dataset):
         self.tile_configs = tile_configs
         self.seg_out_stride = seg_out_stride
         self.balance_50_50 = balance_50_50
+        self.fp_neg_ratio = float(max(0.0, min(1.0, fp_neg_ratio)))
         self.augment_low_vis = augment_low_vis
         self.is_train = is_train
         self.verbose = verbose
@@ -324,6 +343,8 @@ class SegTileDataset(Dataset):
         all_triplets = []
         obj_triplets = []
         non_obj_triplets = []
+        fp_non_obj_triplets = []
+        pure_non_obj_triplets = []
 
         for ridx, r in tqdm(
             enumerate(records),
@@ -334,26 +355,54 @@ class SegTileDataset(Dataset):
             for src_tile_size, src_stride in self.tile_configs:
                 for x0, y0 in tile_origins(r["width"], r["height"], src_tile_size, src_stride):
                     objs = objects_in_tile(r["objects"], x0, y0, src_tile_size)
+                    pos_objs = [o for o in objs if not bool(o.get("is_fp", False))]
+                    fp_objs = [o for o in objs if bool(o.get("is_fp", False))]
                     item = {
                         "ridx": ridx,
                         "x0": x0,
                         "y0": y0,
                         "src_tile_size": src_tile_size,
                         "objs": objs,
-                        "is_object": int(len(objs) > 0),
+                        "pos_objs": pos_objs,
+                        "fp_objs": fp_objs,
+                        "is_object": int(len(pos_objs) > 0),
+                        "has_fp": int(len(fp_objs) > 0),
                     }
                     all_triplets.append(item)
                     if item["is_object"] == 1:
                         obj_triplets.append(item)
                     else:
                         non_obj_triplets.append(item)
+                        if item["has_fp"] == 1:
+                            fp_non_obj_triplets.append(item)
+                        else:
+                            pure_non_obj_triplets.append(item)
 
         if balance_50_50 and len(obj_triplets) > 0 and len(non_obj_triplets) > 0:
             n = min(len(obj_triplets), len(non_obj_triplets))
             rng = np.random.default_rng(seed)
             pos_sel = rng.choice(len(obj_triplets), size=n, replace=False)
-            neg_sel = rng.choice(len(non_obj_triplets), size=n, replace=False)
-            self.samples = [obj_triplets[i] for i in pos_sel] + [non_obj_triplets[i] for i in neg_sel]
+            n_fp = min(len(fp_non_obj_triplets), int(round(n * self.fp_neg_ratio)))
+            n_rest = n - n_fp
+            sel_neg = []
+            if n_fp > 0:
+                fp_sel = rng.choice(len(fp_non_obj_triplets), size=n_fp, replace=False)
+                sel_neg.extend([fp_non_obj_triplets[i] for i in fp_sel])
+            if n_rest > 0:
+                pool = pure_non_obj_triplets
+                if len(pool) >= n_rest:
+                    rest_sel = rng.choice(len(pool), size=n_rest, replace=False)
+                    sel_neg.extend([pool[i] for i in rest_sel])
+                else:
+                    if len(pool) > 0:
+                        sel_neg.extend(pool)
+                    rem = n_rest - len(pool)
+                    if rem > 0:
+                        pool2 = non_obj_triplets
+                        rep = rem > len(pool2)
+                        fill_sel = rng.choice(len(pool2), size=rem, replace=rep)
+                        sel_neg.extend([pool2[i] for i in fill_sel])
+            self.samples = [obj_triplets[i] for i in pos_sel] + sel_neg
             rng.shuffle(self.samples)
         else:
             self.samples = all_triplets
@@ -361,6 +410,7 @@ class SegTileDataset(Dataset):
         # Dataset-level positive/negative index lists (relative to self.samples).
         self.pos_dataset_indices = [i for i, s in enumerate(self.samples) if s["is_object"] == 1]
         self.neg_dataset_indices = [i for i, s in enumerate(self.samples) if s["is_object"] == 0]
+        self.fp_neg_dataset_indices = [i for i, s in enumerate(self.samples) if (s["is_object"] == 0 and s["has_fp"] == 1)]
         self.neg_hard_scores = np.zeros(len(self.samples), dtype=np.float32)
 
         self.normalize = torchvision.transforms.Normalize(
@@ -370,7 +420,8 @@ class SegTileDataset(Dataset):
             print(
                 f"{dataset_name}_tiles built: total={len(self.samples)} "
                 f"pos={len(self.pos_dataset_indices)} neg={len(self.neg_dataset_indices)} "
-                f"(balanced={self.balance_50_50})"
+                f"fp_neg={len(self.fp_neg_dataset_indices)} "
+                f"(balanced={self.balance_50_50} fp_neg_ratio={self.fp_neg_ratio:.2f})"
             )
 
     def __len__(self) -> int:
@@ -471,27 +522,31 @@ class SegTileDataset(Dataset):
             tile = self._low_vis_augment(tile)
 
         scale = float(self.tile_size) / float(max(src_tile_size, 1))
-        objs_scaled = []
+        pos_objs_scaled = []
+        fp_objs_scaled = []
         for o in item["objs"]:
             bx0, by0, bx1, by1 = o["bbox_xyxy"]
             spts = [[float(px) * scale, float(py) * scale] for px, py in (o.get("points", []) or [])]
-            objs_scaled.append(
-                {
-                    "bbox_xyxy": [bx0 * scale, by0 * scale, bx1 * scale, by1 * scale],
-                    "points": spts,
-                    "shape_type": o.get("shape_type", "polygon"),
-                    "poly_area": o["poly_area"],
-                }
-            )
+            rec = {
+                "bbox_xyxy": [bx0 * scale, by0 * scale, bx1 * scale, by1 * scale],
+                "points": spts,
+                "shape_type": o.get("shape_type", "polygon"),
+                "poly_area": o["poly_area"],
+            }
+            if bool(o.get("is_fp", False)):
+                fp_objs_scaled.append(rec)
+            else:
+                pos_objs_scaled.append(rec)
 
-        seg_t = build_seg_target(self.tile_size, objs_scaled, self.seg_out_stride)
+        seg_t = build_seg_target(self.tile_size, pos_objs_scaled, self.seg_out_stride)
+        fp_t = build_seg_target(self.tile_size, fp_objs_scaled, self.seg_out_stride)
 
         # Build a zoom ROI classification target:
         # positives use largest object bbox with context; negatives use deterministic random background crop.
-        if len(objs_scaled) > 0:
+        if len(pos_objs_scaled) > 0:
             best = None
             best_area = -1.0
-            for o in objs_scaled:
+            for o in pos_objs_scaled:
                 bx0, by0, bx1, by1 = o["bbox_xyxy"]
                 a = float(max(0.0, bx1 - bx0) * max(0.0, by1 - by0))
                 if a > best_area:
@@ -508,6 +563,27 @@ class SegTileDataset(Dataset):
             zx1 = min(float(self.tile_size), cx + bw * 0.5)
             zy1 = min(float(self.tile_size), cy + bh * 0.5)
             zoom_target = 1.0
+        elif len(fp_objs_scaled) > 0:
+            # Negative zoom: prefer annotated false-positive regions as hard negatives.
+            best = None
+            best_area = -1.0
+            for o in fp_objs_scaled:
+                bx0, by0, bx1, by1 = o["bbox_xyxy"]
+                a = float(max(0.0, bx1 - bx0) * max(0.0, by1 - by0))
+                if a > best_area:
+                    best_area = a
+                    best = (float(bx0), float(by0), float(bx1), float(by1))
+            assert best is not None
+            bx0, by0, bx1, by1 = best
+            cx = 0.5 * (bx0 + bx1)
+            cy = 0.5 * (by0 + by1)
+            bw = max(10.0, (bx1 - bx0) * 1.8)
+            bh = max(10.0, (by1 - by0) * 1.8)
+            zx0 = max(0.0, cx - bw * 0.5)
+            zy0 = max(0.0, cy - bh * 0.5)
+            zx1 = min(float(self.tile_size), cx + bw * 0.5)
+            zy1 = min(float(self.tile_size), cy + bh * 0.5)
+            zoom_target = 0.0
         else:
             # Deterministic pseudo-random negative crop by dataset index.
             rr = np.random.default_rng(self.seed * 1_000_003 + int(idx))
@@ -532,6 +608,7 @@ class SegTileDataset(Dataset):
         return {
             "image": x,
             "seg_target": torch.from_numpy(seg_t).unsqueeze(0),
+            "fp_target": torch.from_numpy(fp_t).unsqueeze(0),
             "tile_target": torch.tensor([float(item["is_object"])], dtype=torch.float32),
             "zoom_target": torch.tensor([float(zoom_target)], dtype=torch.float32),
             "zoom_box": torch.tensor([zx0, zy0, zx1, zy1], dtype=torch.float32),
@@ -539,7 +616,8 @@ class SegTileDataset(Dataset):
                 "image_path": r["image_path"],
                 "tile_origin": (x0, y0),
                 "source_tile_size": src_tile_size,
-                "num_objects": len(item["objs"]),
+                "num_objects": len(item["pos_objs"]),
+                "num_fp_objects": len(item["fp_objs"]),
                 "is_positive_tile": int(item["is_object"]),
                 "sample_index": int(idx),
             },
@@ -1046,6 +1124,8 @@ def run_epoch(
     boundary_weight: float,
     tile_cls_weight: float,
     zoom_cls_weight: float,
+    use_fp_supervision: bool,
+    fp_neg_weight: float,
     train: bool,
     epoch: int,
     split_name: str,
@@ -1064,9 +1144,11 @@ def run_epoch(
     boundary_losses = []
     tile_cls_losses = []
     zoom_cls_losses = []
+    fp_sup_losses = []
     soft_iou_scores = []
     pos_iou_scores = []
     neg_fp_rates = []
+    fp_activation_scores = []
     hard_scores: Dict[int, float] = {}
 
     pbar = tqdm(loader, desc=f"{split_name} epoch {epoch:02d}", leave=dataloader_verbose)
@@ -1077,6 +1159,7 @@ def run_epoch(
         data_time = now - last_step_time
         x = batch["image"].to(device)
         seg_t = batch["seg_target"].to(device)
+        fp_t = batch.get("fp_target", None)
         tile_t = batch["tile_target"].to(device)
         zoom_t = batch.get("zoom_target", None)
         zoom_box = batch.get("zoom_box", None)
@@ -1084,6 +1167,8 @@ def run_epoch(
             zoom_t = zoom_t.to(device)
         if zoom_box is not None:
             zoom_box = zoom_box.to(device)
+        if fp_t is not None:
+            fp_t = fp_t.to(device)
         grad_norm_val: Optional[float] = None
 
         with torch.set_grad_enabled(train):
@@ -1107,6 +1192,17 @@ def run_epoch(
                 loss = loss + zoom_cls_weight * zoom_bce
                 zoom_cls_val = float(zoom_bce.detach().item())
             parts["zoom_cls"] = zoom_cls_val
+            fp_sup_val = float("nan")
+            if use_fp_supervision and (fp_neg_weight > 0) and (fp_t is not None):
+                fp_mask = fp_t > 0.5
+                if bool(fp_mask.any().item()):
+                    fp_bce = F.binary_cross_entropy_with_logits(
+                        pred["seg_logit"][fp_mask],
+                        torch.zeros_like(pred["seg_logit"][fp_mask]),
+                    )
+                    loss = loss + fp_neg_weight * fp_bce
+                    fp_sup_val = float(fp_bce.detach().item())
+            parts["fp_sup"] = fp_sup_val
             parts["total"] = float(loss.detach().item())
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -1126,15 +1222,22 @@ def run_epoch(
         soft_iou_val = metric_vals["soft_iou"]
         pos_iou_val = metric_vals["pos_iou"]
         neg_fp_val = metric_vals["neg_fp_rate"]
+        fp_activation_val = float("nan")
+        if fp_t is not None:
+            fp_mask_eval = fp_t > 0.5
+            if bool(fp_mask_eval.any().item()):
+                fp_activation_val = float(torch.sigmoid(pred["seg_logit"].detach())[fp_mask_eval].mean().item())
         total_losses.append(loss_val)
         mcc_losses.append(parts["mcc"])
         bce_losses.append(parts["bce"])
         boundary_losses.append(parts["boundary"])
         tile_cls_losses.append(parts["tile_cls"])
         zoom_cls_losses.append(parts["zoom_cls"])
+        fp_sup_losses.append(parts["fp_sup"])
         soft_iou_scores.append(soft_iou_val)
         pos_iou_scores.append(pos_iou_val)
         neg_fp_rates.append(neg_fp_val)
+        fp_activation_scores.append(fp_activation_val)
 
         if collect_hard_scores:
             probs = torch.sigmoid(pred["seg_logit"].detach())
@@ -1167,9 +1270,13 @@ def run_epoch(
                 writer.add_scalar(f"loss_step/{split_name}_tile_cls", parts["tile_cls"], gs)
             if not math.isnan(parts["zoom_cls"]):
                 writer.add_scalar(f"loss_step/{split_name}_zoom_cls", parts["zoom_cls"], gs)
+            if not math.isnan(parts["fp_sup"]):
+                writer.add_scalar(f"loss_step/{split_name}_fp_sup", parts["fp_sup"], gs)
             writer.add_scalar(f"metric_step/{split_name}_soft_iou", soft_iou_val, gs)
             writer.add_scalar(f"metric_step/{split_name}_pos_iou", pos_iou_val, gs)
             writer.add_scalar(f"metric_step/{split_name}_neg_fp_rate", neg_fp_val, gs)
+            if not math.isnan(fp_activation_val):
+                writer.add_scalar(f"metric_step/{split_name}_fp_activation", fp_activation_val, gs)
             # Backward-compatible alias: mask_iou now reports soft_iou.
             writer.add_scalar(f"metric_step/{split_name}_mask_iou", soft_iou_val, gs)
             if grad_norm_val is not None:
@@ -1184,6 +1291,8 @@ def run_epoch(
         }
         if grad_norm_val is not None:
             postfix["grad"] = f"{grad_norm_val:.3f}"
+        if not math.isnan(parts["fp_sup"]):
+            postfix["fp_sup"] = f"{parts['fp_sup']:.3f}"
         if dataloader_verbose:
             step_time = time.time() - now
             postfix["data_s"] = f"{data_time:.3f}"
@@ -1191,18 +1300,28 @@ def run_epoch(
         pbar.set_postfix(postfix)
         last_step_time = time.time()
 
+    def _safe_nanmean(vals: List[float]) -> float:
+        if len(vals) == 0:
+            return float("nan")
+        arr = np.array(vals, dtype=np.float32)
+        if not np.any(~np.isnan(arr)):
+            return float("nan")
+        return float(np.nanmean(arr))
+
     return {
         "total_loss": float(np.mean(total_losses)) if total_losses else float("nan"),
         "mcc_loss": float(np.mean(mcc_losses)) if mcc_losses else float("nan"),
         "bce_loss": float(np.mean(bce_losses)) if bce_losses else float("nan"),
         "boundary_loss": float(np.mean(boundary_losses)) if boundary_losses else float("nan"),
-        "tile_cls_loss": float(np.nanmean(tile_cls_losses)) if tile_cls_losses else float("nan"),
-        "zoom_cls_loss": float(np.nanmean(zoom_cls_losses)) if zoom_cls_losses else float("nan"),
-        "soft_iou": float(np.nanmean(soft_iou_scores)) if soft_iou_scores else float("nan"),
-        "pos_iou": float(np.nanmean(pos_iou_scores)) if pos_iou_scores else float("nan"),
-        "neg_fp_rate": float(np.nanmean(neg_fp_rates)) if neg_fp_rates else float("nan"),
+        "tile_cls_loss": _safe_nanmean(tile_cls_losses),
+        "zoom_cls_loss": _safe_nanmean(zoom_cls_losses),
+        "fp_sup_loss": _safe_nanmean(fp_sup_losses),
+        "soft_iou": _safe_nanmean(soft_iou_scores),
+        "pos_iou": _safe_nanmean(pos_iou_scores),
+        "neg_fp_rate": _safe_nanmean(neg_fp_rates),
+        "fp_activation": _safe_nanmean(fp_activation_scores),
         # Backward-compatible alias: mask_iou now reports soft_iou.
-        "mask_iou": float(np.nanmean(soft_iou_scores)) if soft_iou_scores else float("nan"),
+        "mask_iou": _safe_nanmean(soft_iou_scores),
         "hard_scores": hard_scores,
         "num_steps": int(step_count),
     }
@@ -1266,6 +1385,7 @@ def parse_args() -> Cfg:
 
     ap.add_argument("--label", dest="label_name", type=str, default="vehicle")
     ap.add_argument("--label-name", dest="label_name", type=str, help=argparse.SUPPRESS)
+    ap.add_argument("--fp-label", type=str, default="fp")
     ap.add_argument("--min-poly-points", type=int, default=3)
 
     ap.add_argument("--seg-out-stride", type=int, default=4)
@@ -1291,6 +1411,10 @@ def parse_args() -> Cfg:
     ap.add_argument("--use-zoom-cls-head", action="store_true", default=True)
     ap.add_argument("--no-use-zoom-cls-head", action="store_false", dest="use_zoom_cls_head")
     ap.add_argument("--zoom-cls-weight", type=float, default=0.2)
+    ap.add_argument("--use-fp-supervision", action="store_true", default=True)
+    ap.add_argument("--no-use-fp-supervision", action="store_false", dest="use_fp_supervision")
+    ap.add_argument("--fp-neg-weight", type=float, default=0.3)
+    ap.add_argument("--fp-neg-ratio", type=float, default=0.5)
 
     ap.add_argument("--balance-train-50-50", action="store_true", default=True)
     ap.add_argument("--no-balance-train-50-50", action="store_false", dest="balance_train_50_50")
@@ -1330,6 +1454,7 @@ def parse_args() -> Cfg:
         tile_stride=a.tile_stride,
         tile_scales=a.tile_scales,
         label_name=a.label_name,
+        fp_label=a.fp_label,
         min_poly_points=a.min_poly_points,
         seg_out_stride=a.seg_out_stride,
         batch_size=a.batch_size,
@@ -1348,6 +1473,9 @@ def parse_args() -> Cfg:
         tile_cls_weight=a.tile_cls_weight,
         use_zoom_cls_head=a.use_zoom_cls_head,
         zoom_cls_weight=a.zoom_cls_weight,
+        use_fp_supervision=a.use_fp_supervision,
+        fp_neg_weight=a.fp_neg_weight,
+        fp_neg_ratio=a.fp_neg_ratio,
         balance_train_50_50=a.balance_train_50_50,
         balance_val_50_50=a.balance_val_50_50,
         augment_low_vis=a.augment_low_vis,
@@ -1406,7 +1534,13 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=str(run_dir))
 
-    records = load_records(cfg.data_dir, cfg.label_name, cfg.min_poly_points)
+    records = load_records(
+        cfg.data_dir,
+        cfg.label_name,
+        cfg.min_poly_points,
+        include_fp=True,
+        fp_label=cfg.fp_label,
+    )
     if len(records) == 0:
         raise RuntimeError("No records found.")
 
@@ -1435,12 +1569,16 @@ def main() -> None:
         print(f"  head_type={cfg.head_type}")
     print(f"  use_tile_cls_head={cfg.use_tile_cls_head} tile_cls_weight={cfg.tile_cls_weight}")
     print(f"  use_zoom_cls_head={cfg.use_zoom_cls_head} zoom_cls_weight={cfg.zoom_cls_weight}")
+    print(
+        f"  use_fp_supervision={cfg.use_fp_supervision} fp_label='{cfg.fp_label}' "
+        f"fp_neg_weight={cfg.fp_neg_weight} fp_neg_ratio={cfg.fp_neg_ratio}"
+    )
     print(f"  val_interval={cfg.val_interval}, image_log_interval={cfg.image_log_interval}")
     print(f"  iou_threshold={cfg.iou_threshold}")
     print(
         f"  loss={cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + "
         f"{cfg.boundary_weight}*boundary + {cfg.tile_cls_weight}*tile_cls + "
-        f"{cfg.zoom_cls_weight}*zoom_cls"
+        f"{cfg.zoom_cls_weight}*zoom_cls + {cfg.fp_neg_weight}*fp_sup(if enabled)"
     )
     print(f"  mcc_warmup_epochs={cfg.mcc_warmup_epochs}")
     print(f"  lr={cfg.lr} lr_scheduler={cfg.lr_scheduler} lr_min={cfg.lr_min}")
@@ -1464,6 +1602,7 @@ def main() -> None:
         seg_out_stride=cfg.seg_out_stride,
         seed=cfg.seed,
         balance_50_50=cfg.balance_train_50_50,
+        fp_neg_ratio=cfg.fp_neg_ratio,
         augment_low_vis=cfg.augment_low_vis,
         is_train=True,
         dataset_name="train",
@@ -1476,6 +1615,7 @@ def main() -> None:
         seg_out_stride=cfg.seg_out_stride,
         seed=cfg.seed,
         balance_50_50=cfg.balance_val_50_50,
+        fp_neg_ratio=cfg.fp_neg_ratio,
         augment_low_vis=False,
         is_train=False,
         dataset_name="val",
@@ -1490,6 +1630,9 @@ def main() -> None:
         train_ds.samples = [train_ds.samples[i] for i in keep_idx]
         train_ds.pos_dataset_indices = [i for i, s in enumerate(train_ds.samples) if s["is_object"] == 1]
         train_ds.neg_dataset_indices = [i for i, s in enumerate(train_ds.samples) if s["is_object"] == 0]
+        train_ds.fp_neg_dataset_indices = [
+            i for i, s in enumerate(train_ds.samples) if (s["is_object"] == 0 and s.get("has_fp", 0) == 1)
+        ]
         train_ds.neg_hard_scores = np.zeros(len(train_ds.samples), dtype=np.float32)
         print(
             f"Applied subset_size={cfg.subset_size} after balancing. "
@@ -1501,7 +1644,8 @@ def main() -> None:
 
     print(
         f"train_tile_balance: pos={len(getattr(train_ds, 'pos_dataset_indices', []))} "
-        f"neg={len(getattr(train_ds, 'neg_dataset_indices', []))}"
+        f"neg={len(getattr(train_ds, 'neg_dataset_indices', []))} "
+        f"fp_neg={len(getattr(train_ds, 'fp_neg_dataset_indices', []))}"
     )
     if len(getattr(train_ds, "pos_dataset_indices", [])) == 0:
         found = discover_labels(cfg.data_dir)
@@ -1669,6 +1813,8 @@ def main() -> None:
             boundary_weight=cfg.boundary_weight,
             tile_cls_weight=cfg.tile_cls_weight,
             zoom_cls_weight=cfg.zoom_cls_weight,
+            use_fp_supervision=cfg.use_fp_supervision,
+            fp_neg_weight=cfg.fp_neg_weight,
             train=True,
             epoch=epoch,
             split_name="train",
@@ -1688,9 +1834,11 @@ def main() -> None:
             "boundary_loss": float("nan"),
             "tile_cls_loss": float("nan"),
             "zoom_cls_loss": float("nan"),
+            "fp_sup_loss": float("nan"),
             "soft_iou": float("nan"),
             "pos_iou": float("nan"),
             "neg_fp_rate": float("nan"),
+            "fp_activation": float("nan"),
             "mask_iou": float("nan"),
         }
         if epoch % cfg.val_interval == 0:
@@ -1705,6 +1853,8 @@ def main() -> None:
                 boundary_weight=cfg.boundary_weight,
                 tile_cls_weight=cfg.tile_cls_weight,
                 zoom_cls_weight=cfg.zoom_cls_weight,
+                use_fp_supervision=cfg.use_fp_supervision,
+                fp_neg_weight=cfg.fp_neg_weight,
                 train=False,
                 epoch=epoch,
                 split_name="val",
@@ -1720,15 +1870,19 @@ def main() -> None:
             "train_total": tr["total_loss"],
             "train_tile_cls_loss": tr["tile_cls_loss"],
             "train_zoom_cls_loss": tr["zoom_cls_loss"],
+            "train_fp_sup_loss": tr["fp_sup_loss"],
             "train_iou": tr["soft_iou"],
             "train_pos_iou": tr["pos_iou"],
             "train_neg_fp_rate": tr["neg_fp_rate"],
+            "train_fp_activation": tr["fp_activation"],
             "val_total": va["total_loss"],
             "val_tile_cls_loss": va["tile_cls_loss"],
             "val_zoom_cls_loss": va["zoom_cls_loss"],
+            "val_fp_sup_loss": va["fp_sup_loss"],
             "val_iou": va["soft_iou"],
             "val_pos_iou": va["pos_iou"],
             "val_neg_fp_rate": va["neg_fp_rate"],
+            "val_fp_activation": va["fp_activation"],
         }
         history.append(row)
 
@@ -1737,13 +1891,15 @@ def main() -> None:
             f"lr={lr_now:.8f} "
             f"mcc_w={epoch_mcc_weight:.4f} "
             f"train_total={row['train_total']:.4f} train_tile_cls={row['train_tile_cls_loss']:.4f} "
-            f"train_zoom_cls={row['train_zoom_cls_loss']:.4f} "
+            f"train_zoom_cls={row['train_zoom_cls_loss']:.4f} train_fp_sup={row['train_fp_sup_loss']:.4f} "
             f"train_iou={row['train_iou']:.4f} "
             f"train_pos_iou={row['train_pos_iou']:.4f} train_neg_fp={row['train_neg_fp_rate']:.4f} "
+            f"train_fp_act={row['train_fp_activation']:.4f} "
             f"val_total={row['val_total']:.4f} val_tile_cls={row['val_tile_cls_loss']:.4f} "
-            f"val_zoom_cls={row['val_zoom_cls_loss']:.4f} "
+            f"val_zoom_cls={row['val_zoom_cls_loss']:.4f} val_fp_sup={row['val_fp_sup_loss']:.4f} "
             f"val_iou={row['val_iou']:.4f} "
-            f"val_pos_iou={row['val_pos_iou']:.4f} val_neg_fp={row['val_neg_fp_rate']:.4f}"
+            f"val_pos_iou={row['val_pos_iou']:.4f} val_neg_fp={row['val_neg_fp_rate']:.4f} "
+            f"val_fp_act={row['val_fp_activation']:.4f}"
         )
 
         writer.add_scalar("lr/epoch", lr_now, epoch)
@@ -1751,20 +1907,28 @@ def main() -> None:
         writer.add_scalar("metric/train_soft_iou", row["train_iou"], epoch)
         writer.add_scalar("metric/train_pos_iou", row["train_pos_iou"], epoch)
         writer.add_scalar("metric/train_neg_fp_rate", row["train_neg_fp_rate"], epoch)
+        if not math.isnan(row["train_fp_activation"]):
+            writer.add_scalar("metric/train_fp_activation", row["train_fp_activation"], epoch)
         if not math.isnan(row["train_tile_cls_loss"]):
             writer.add_scalar("loss_epoch/train_tile_cls", row["train_tile_cls_loss"], epoch)
         if not math.isnan(row["train_zoom_cls_loss"]):
             writer.add_scalar("loss_epoch/train_zoom_cls", row["train_zoom_cls_loss"], epoch)
+        if not math.isnan(row["train_fp_sup_loss"]):
+            writer.add_scalar("loss_epoch/train_fp_sup", row["train_fp_sup_loss"], epoch)
         # Backward-compatible alias: mask_iou now reports soft_iou.
         writer.add_scalar("metric/train_mask_iou", row["train_iou"], epoch)
         if epoch % cfg.val_interval == 0:
             writer.add_scalar("metric/val_soft_iou", row["val_iou"], epoch)
             writer.add_scalar("metric/val_pos_iou", row["val_pos_iou"], epoch)
             writer.add_scalar("metric/val_neg_fp_rate", row["val_neg_fp_rate"], epoch)
+            if not math.isnan(row["val_fp_activation"]):
+                writer.add_scalar("metric/val_fp_activation", row["val_fp_activation"], epoch)
             if not math.isnan(row["val_tile_cls_loss"]):
                 writer.add_scalar("loss_epoch/val_tile_cls", row["val_tile_cls_loss"], epoch)
             if not math.isnan(row["val_zoom_cls_loss"]):
                 writer.add_scalar("loss_epoch/val_zoom_cls", row["val_zoom_cls_loss"], epoch)
+            if not math.isnan(row["val_fp_sup_loss"]):
+                writer.add_scalar("loss_epoch/val_fp_sup", row["val_fp_sup_loss"], epoch)
             # Backward-compatible alias: mask_iou now reports soft_iou.
             writer.add_scalar("metric/val_mask_iou", row["val_iou"], epoch)
 
