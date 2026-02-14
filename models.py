@@ -1,225 +1,176 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
+
+from backbones_adapters import (
+    AnyUpFeatureUpsampler,
+    DinoLearnedUpsampler,
+    DinoPixelShuffleUpsampler,
+    FrozenDinoTokenBranch,
+    ResNet18LocalBranch,
+)
+from heads import (
+    AnyUpDwSepSegHead,
+    AnyUpPointwiseSegHead,
+    AnyUpResidualPointwiseSegHead,
+    SegmentationHead,
+    TileClassifierHead,
+    ZoomRoiClassifierHead,
+)
 
 
-class FrozenDinoTokenBranch(nn.Module):
-    def __init__(self, out_channels: int = 256, trust_repo: bool = True):
-        super().__init__()
-        self.backbone = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_vits14", trust_repo=trust_repo
+def parse_dino_layers_spec(
+    spec: Union[str, Sequence[int], None],
+    depth: int = 12,
+) -> Tuple[int, ...]:
+    if spec is None:
+        return (depth - 1,)
+    if isinstance(spec, (list, tuple)):
+        vals = [int(v) for v in spec]
+    else:
+        s = str(spec).strip().lower()
+        if s in {"", "last", "final"}:
+            return (depth - 1,)
+        vals = []
+        for part in s.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            vals.append(int(p))
+    if len(vals) == 0:
+        return (depth - 1,)
+
+    out: List[int] = []
+    for v in vals:
+        # User-facing format is 1-based layer ids (e.g. 6,9,12).
+        idx = v - 1 if v >= 1 else v
+        if idx < 0 or idx >= depth:
+            raise ValueError(f"Invalid dino layer '{v}' for depth={depth}. Expected 1..{depth}.")
+        out.append(int(idx))
+    return tuple(out)
+
+
+def _interp_1d(src: torch.Tensor, out_len: int) -> torch.Tensor:
+    x = src.reshape(1, 1, -1)
+    y = F.interpolate(x, size=out_len, mode="linear", align_corners=False)
+    return y.reshape(out_len)
+
+
+def _interp_2d(src: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
+    x = src.reshape(1, 1, int(src.shape[0]), int(src.shape[1]))
+    y = F.interpolate(x, size=out_hw, mode="bilinear", align_corners=False)
+    return y.reshape(out_hw[0], out_hw[1])
+
+
+def _maybe_interpolate_tensor(src: torch.Tensor, target_shape: torch.Size) -> Optional[torch.Tensor]:
+    tgt = tuple(int(v) for v in target_shape)
+    if tuple(int(v) for v in src.shape) == tgt:
+        return src
+
+    # 1D vectors (biases, affine parameters): resize length.
+    if src.ndim == 1 and len(tgt) == 1:
+        return _interp_1d(src, tgt[0])
+
+    # 2D matrices (linear weights): resize on whichever/both axes changed.
+    if src.ndim == 2 and len(tgt) == 2:
+        return _interp_2d(src, (tgt[0], tgt[1]))
+
+    # 3D tensors (e.g. [1, N, C] style embeddings): interpolate sequence dim if C matches.
+    if src.ndim == 3 and len(tgt) == 3:
+        if src.shape[0] == tgt[0] and src.shape[2] == tgt[2]:
+            x = src.transpose(1, 2)  # [B, C, N]
+            y = F.interpolate(x, size=tgt[1], mode="linear", align_corners=False)
+            return y.transpose(1, 2)
+        return None
+
+    # 4D tensors (conv kernels/feature maps): interpolate only spatial dims when channels match.
+    if src.ndim == 4 and len(tgt) == 4:
+        if src.shape[0] == tgt[0] and src.shape[1] == tgt[1]:
+            b = int(src.shape[0] * src.shape[1])
+            x = src.reshape(b, 1, int(src.shape[2]), int(src.shape[3]))
+            y = F.interpolate(x, size=(tgt[2], tgt[3]), mode="bilinear", align_corners=False)
+            return y.reshape(tgt[0], tgt[1], tgt[2], tgt[3])
+        return None
+
+    return None
+
+
+def load_stage1_state_dict_compat(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    strict: bool = False,
+    interpolate_mismatch: bool = True,
+    verbose: bool = True,
+) -> Dict[str, List]:
+    model_state = model.state_dict()
+    adapted: Dict[str, torch.Tensor] = {}
+
+    missing_in_ckpt: List[str] = []
+    unexpected_in_ckpt: List[str] = []
+    interpolated: List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
+    skipped_mismatch: List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
+
+    for k in state_dict.keys():
+        if k not in model_state:
+            unexpected_in_ckpt.append(k)
+
+    for k, tgt in model_state.items():
+        if k not in state_dict:
+            missing_in_ckpt.append(k)
+            continue
+
+        src = state_dict[k]
+        if isinstance(src, nn.Parameter):
+            src = src.detach()
+
+        if tuple(src.shape) == tuple(tgt.shape):
+            adapted[k] = src
+            continue
+
+        if interpolate_mismatch:
+            resized = _maybe_interpolate_tensor(src, tgt.shape)
+            if resized is not None:
+                adapted[k] = resized.to(dtype=tgt.dtype)
+                interpolated.append((k, tuple(src.shape), tuple(tgt.shape)))
+                continue
+
+        skipped_mismatch.append((k, tuple(src.shape), tuple(tgt.shape)))
+
+    model.load_state_dict(adapted, strict=False)
+
+    if verbose:
+        if interpolated:
+            print("checkpoint compat: interpolated tensors:")
+            for k, src_shape, tgt_shape in interpolated:
+                print(f"  - {k}: {src_shape} -> {tgt_shape}")
+        if skipped_mismatch:
+            print("checkpoint compat: skipped mismatched tensors:")
+            for k, src_shape, tgt_shape in skipped_mismatch:
+                print(f"  - {k}: {src_shape} != {tgt_shape}")
+        if missing_in_ckpt:
+            print(f"checkpoint compat: missing tensors in checkpoint={len(missing_in_ckpt)}")
+        if unexpected_in_ckpt:
+            print(f"checkpoint compat: unexpected tensors in checkpoint={len(unexpected_in_ckpt)}")
+
+    if strict and (missing_in_ckpt or unexpected_in_ckpt or skipped_mismatch):
+        raise RuntimeError(
+            "Strict compatible checkpoint load failed with missing/unexpected/mismatched tensors. "
+            f"missing={len(missing_in_ckpt)} unexpected={len(unexpected_in_ckpt)} "
+            f"skipped_mismatch={len(skipped_mismatch)}"
         )
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        self.backbone.eval()
-        self.proj = nn.Conv2d(384, out_channels, kernel_size=1)
 
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.backbone.eval()
-        feats = self.backbone.forward_features(x)
-        tokens = feats["x_norm_patchtokens"]
-        b, n, c = tokens.shape
-        h = w = int(math.sqrt(n))
-        fmap = tokens.transpose(1, 2).reshape(b, c, h, w)
-        return self.proj(fmap)
-
-
-class DinoLearnedUpsampler(nn.Module):
-    def __init__(self, channels: int = 256):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.act1 = nn.GELU()
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.act2 = nn.GELU()
-
-    def forward(self, x: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x = self.act1(self.conv1(x))
-        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x = self.act2(self.conv2(x))
-        if x.shape[-2:] != target_hw:
-            x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
-        return x
-
-
-class AnyUpFeatureUpsampler(nn.Module):
-    def __init__(self, q_chunk_size: int = 256, trust_repo: bool = True):
-        super().__init__()
-        self.q_chunk_size = q_chunk_size
-        self.upsampler = torch.hub.load(
-            "wimmerth/anyup",
-            "anyup",
-            verbose=False,
-            trust_repo=trust_repo,
-        )
-        self.upsampler.eval()
-        for p in self.upsampler.parameters():
-            p.requires_grad = False
-
-    @torch.no_grad()
-    def forward(self, hr_image: torch.Tensor, lr_features: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
-        self.upsampler.eval()
-        x = self.upsampler(hr_image, lr_features, q_chunk_size=self.q_chunk_size)
-        if x.shape[-2:] != target_hw:
-            x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
-        return x
-
-
-class ResNet18LocalBranch(nn.Module):
-    def __init__(self, out_channels: int = 256):
-        super().__init__()
-        m = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
-        self.stem = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)
-        self.l1 = m.layer1
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.l1(x)
-        return x
-
-
-class SegmentationHead(nn.Module):
-    def __init__(self, channels: int = 256):
-        super().__init__()
-        self.seg_head = nn.Conv2d(channels, 1, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {"seg_logit": self.seg_head(x)}
-
-
-class AnyUpPointwiseSegHead(nn.Module):
-    def __init__(self, in_channels: int = 256):
-        super().__init__()
-        mid = max(1, in_channels // 2)
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, 1, kernel_size=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {"seg_logit": self.net(x)}
-
-
-class AnyUpDwSepSegHead(nn.Module):
-    def __init__(self, in_channels: int = 256):
-        super().__init__()
-        mid = max(1, in_channels // 2)
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid),
-            nn.Conv2d(mid, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid),
-            nn.Conv2d(mid, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, 1, kernel_size=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {"seg_logit": self.net(x)}
-
-
-class AnyUpResidualPointwiseSegHead(nn.Module):
-    def __init__(self, in_channels: int = 256):
-        super().__init__()
-        mid = max(1, in_channels // 2)
-        self.in_proj = nn.Conv2d(in_channels, mid, kernel_size=1)
-        self.block1 = nn.Sequential(
-            nn.Conv2d(mid, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, mid, kernel_size=1),
-        )
-        self.block2 = nn.Sequential(
-            nn.Conv2d(mid, mid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid, mid, kernel_size=1),
-        )
-        self.act = nn.GELU()
-        self.out_proj = nn.Conv2d(mid, 1, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        x = self.act(self.in_proj(x))
-        x = self.act(x + self.block1(x))
-        x = self.act(x + self.block2(x))
-        return {"seg_logit": self.out_proj(x)}
-
-
-class TileClassifierHead(nn.Module):
-    def __init__(self, in_channels: int = 256):
-        super().__init__()
-        hid = max(8, in_channels // 2)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc1 = nn.Linear(in_channels, hid)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hid, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.pool(x).flatten(1)
-        z = self.act(self.fc1(z))
-        return self.fc2(z)
-
-
-class ZoomRoiClassifierHead(nn.Module):
-    def __init__(self, in_channels: int = 256, roi_size: int = 8):
-        super().__init__()
-        self.roi_size = int(roi_size)
-        hid = max(16, in_channels // 2)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, hid, kernel_size=3, padding=1),
-            nn.GELU(),
-        )
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(hid, 1)
-
-    def forward(self, feat: torch.Tensor, zoom_boxes: torch.Tensor, input_hw: Tuple[int, int]) -> torch.Tensor:
-        b, _c, hf, wf = feat.shape
-        in_h, in_w = int(input_hw[0]), int(input_hw[1])
-        z = zoom_boxes.float()
-        if z.ndim == 3 and z.shape[1] == 1:
-            z = z[:, 0, :]
-        if z.ndim != 2 or z.shape[1] != 4:
-            raise ValueError(f"zoom_boxes must be (B,4), got {tuple(z.shape)}")
-        if z.shape[0] != b:
-            raise ValueError(f"zoom_boxes batch {z.shape[0]} != feat batch {b}")
-
-        x0 = z[:, 0].clamp(0.0, max(0.0, float(in_w - 1)))
-        y0 = z[:, 1].clamp(0.0, max(0.0, float(in_h - 1)))
-        x1 = z[:, 2].clamp(1.0, float(in_w))
-        y1 = z[:, 3].clamp(1.0, float(in_h))
-        x1 = torch.maximum(x1, x0 + 1.0)
-        y1 = torch.maximum(y1, y0 + 1.0)
-
-        sx = float(wf) / float(max(1, in_w))
-        sy = float(hf) / float(max(1, in_h))
-        rois = torch.zeros((b, 5), dtype=torch.float32, device=feat.device)
-        rois[:, 0] = torch.arange(0, b, device=feat.device, dtype=torch.float32)
-        rois[:, 1] = x0 * sx
-        rois[:, 2] = y0 * sy
-        rois[:, 3] = x1 * sx
-        rois[:, 4] = y1 * sy
-
-        pooled = torchvision.ops.roi_align(
-            feat,
-            rois,
-            output_size=(self.roi_size, self.roi_size),
-            spatial_scale=1.0,
-            aligned=True,
-        )
-        zf = self.conv(pooled)
-        zf = self.pool(zf).flatten(1)
-        return self.fc(zf)
+    return {
+        "missing_in_ckpt": missing_in_ckpt,
+        "unexpected_in_ckpt": unexpected_in_ckpt,
+        "interpolated": interpolated,
+        "skipped_mismatch": skipped_mismatch,
+    }
 
 
 class Stage1SegNet(nn.Module):
@@ -230,26 +181,41 @@ class Stage1SegNet(nn.Module):
         dino_upsampler_type: str = "learned",
         anyup_q_chunk_size: int = 256,
         head_type: str = "pointwise",
+        dino_layers: Union[str, Sequence[int], None] = "last",
         use_tile_cls_head: bool = False,
         use_zoom_cls_head: bool = False,
     ):
         super().__init__()
-        if dino_upsampler_type not in {"learned", "anyup"}:
+        if dino_upsampler_type not in {"learned", "pixelshuffle", "anyup"}:
             raise ValueError(f"Unsupported dino_upsampler_type={dino_upsampler_type}")
         if head_type not in {"pointwise", "dwsep", "residual"}:
             raise ValueError(f"Unsupported head_type={head_type}")
         self.dino_upsampler_type = dino_upsampler_type
         self.head_type = head_type
+        self.dino_layers = dino_layers
         self.use_tile_cls_head = bool(use_tile_cls_head)
         self.use_zoom_cls_head = bool(use_zoom_cls_head)
-        self.dino = FrozenDinoTokenBranch(channels, trust_repo=trust_repo)
-        self.dino_up = DinoLearnedUpsampler(channels)
+        # DINOv2 uses patch size 14. We feed a 14/16 downscaled view so that
+        # for 256k inputs we get token grids of 16k (power-of-two).
+        self.dino_input_scale = 14.0 / 16.0
+
+        dino_layer_indices = parse_dino_layers_spec(dino_layers, depth=12)
+        self.dino = FrozenDinoTokenBranch(
+            channels,
+            trust_repo=trust_repo,
+            layer_indices=dino_layer_indices,
+        )
+        if self.dino_upsampler_type == "pixelshuffle":
+            self.dino_up = DinoPixelShuffleUpsampler(channels)
+        else:
+            self.dino_up = DinoLearnedUpsampler(channels)
         self.dino_anyup: Optional[AnyUpFeatureUpsampler] = None
         if self.dino_upsampler_type == "anyup":
             self.dino_anyup = AnyUpFeatureUpsampler(
                 q_chunk_size=anyup_q_chunk_size,
                 trust_repo=trust_repo,
             )
+
         if self.dino_upsampler_type == "anyup":
             self.local = None
             self.fuse_1x1 = None
@@ -270,29 +236,82 @@ class Stage1SegNet(nn.Module):
             self.tile_cls_head = TileClassifierHead(channels) if self.use_tile_cls_head else None
             self.zoom_cls_head = ZoomRoiClassifierHead(channels) if self.use_zoom_cls_head else None
 
-    def forward(self, x: torch.Tensor, zoom_boxes: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        fdino = self.dino(x)
+    def _prepare_dino_input(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = int(x.shape[-2]), int(x.shape[-1])
+        if (h % 256) != 0 or (w % 256) != 0:
+            raise ValueError(
+                f"Stage1SegNet expects input H/W to be multiples of 256, got {(h, w)}. "
+                "Use tile-size 256 or multiples (e.g. 512)."
+            )
+
+        dino_h = int(round(h * self.dino_input_scale))
+        dino_w = int(round(w * self.dino_input_scale))
+        if (dino_h % 14) != 0 or (dino_w % 14) != 0:
+            raise ValueError(
+                f"DINO input {(dino_h, dino_w)} must be divisible by patch size 14."
+            )
+        if dino_h == h and dino_w == w:
+            return x
+        return F.interpolate(x, size=(dino_h, dino_w), mode="bilinear", align_corners=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        zoom_boxes: Optional[torch.Tensor] = None,
+        trace_shapes: bool = False,
+        return_features: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        def _trace(name: str, t: Optional[torch.Tensor]) -> None:
+            if not trace_shapes:
+                return
+            if t is None:
+                print(f"[shape] {name}: None")
+                return
+            print(f"[shape] {name}: {tuple(t.shape)}")
+
+        _trace("input", x)
+        x_dino = self._prepare_dino_input(x)
+        _trace("dino_input_scaled", x_dino)
+        fdino = self.dino(x_dino)
+        _trace("dino_tokens_proj", fdino)
         if self.dino_upsampler_type == "anyup" and self.dino_anyup is not None:
             fdino_up = self.dino_anyup(x, fdino, target_hw=x.shape[-2:])
+            _trace("anyup_features", fdino_up)
             out = self.anyup_head(fdino_up)
+            _trace("head_seg_logit_raw", out.get("seg_logit", None))
             cls_feat = fdino_up
         else:
             flocal = self.local(x)
+            _trace("resnet_l1", flocal)
             fdino_up = self.dino_up(fdino, target_hw=flocal.shape[-2:])
+            _trace("dino_up_features", fdino_up)
             fused = torch.cat([fdino_up, flocal], dim=1)
+            _trace("fuse_concat", fused)
             fused = self.fuse_1x1(fused)
+            _trace("fuse_1x1", fused)
             out = self.head(fused)
+            _trace("head_seg_logit_raw", out.get("seg_logit", None))
             cls_feat = fused
 
         target_hw = (x.shape[-2] // 4, x.shape[-1] // 4)
         out["seg_logit"] = F.interpolate(out["seg_logit"], size=target_hw, mode="bilinear", align_corners=False)
+        _trace("seg_logit_out", out["seg_logit"])
         if self.tile_cls_head is not None:
             out["tile_logit"] = self.tile_cls_head(cls_feat)
+            _trace("tile_logit", out["tile_logit"])
         if self.zoom_cls_head is not None and zoom_boxes is not None:
+            _trace("zoom_boxes", zoom_boxes)
             out["zoom_logit"] = self.zoom_cls_head(
                 cls_feat,
                 zoom_boxes=zoom_boxes,
                 input_hw=(x.shape[-2], x.shape[-1]),
             )
+            _trace("zoom_logit", out["zoom_logit"])
+        if return_features:
+            # Auxiliary features for advanced training objectives.
+            out["feat_dino"] = fdino
+            out["feat_adapted"] = cls_feat
         return out
 
+
+__all__ = ["Stage1SegNet", "load_stage1_state_dict_compat"]

@@ -22,8 +22,17 @@ Shared utilities now live in:
 Core model/loss modules:
 - `models.py`
   - `Stage1SegNet`
-  - frozen DINO + learned/AnyUp branches
-  - segmentation + tile/zoom classifier heads
+  - checkpoint compatibility loader `load_stage1_state_dict_compat(...)`
+  - supports DINO upsamplers: `learned`, `pixelshuffle`, `anyup`
+  - supports DINO layer selection (`last` or e.g. `6,9,12`)
+- `backbones_adapters.py`
+  - frozen DINO token branch (single-layer and multi-layer channel fusion)
+  - learned/pixelshuffle/AnyUp upsamplers
+  - local ResNet branch
+- `heads.py`
+  - segmentation heads (`pointwise`, `dwsep`, `residual`)
+  - tile classifier head
+  - zoom ROI classifier head
 - `losses.py`
   - `mcc_bce_boundary_loss(...)`
   - `segmentation_metrics(...)`
@@ -77,7 +86,7 @@ Script: `train_stage1_seg.py`
 
 Purpose:
 - Train the stage-1 segmentation model on LabelMe image/json pairs.
-- Supports learned upsampler or AnyUp, tile classification head, balancing, HNM, and TensorBoard logging.
+- Supports multi-layer DINO tokens, learned/pixelshuffle/AnyUp upsamplers, tile/zoom heads, balancing, HNM, and TensorBoard logging.
 
 Minimal example:
 ```bash
@@ -97,7 +106,10 @@ Common args:
 - `--subset-size`: final train tile subset size (applied after tile build + balancing).
 - `--batch-size`, `--num-workers`.
 - `--tile-size`, `--tile-stride`, `--tile-scales`.
-- `--dino-upsampler {learned,anyup}`.
+  - Current default is `256/128`.
+  - Model expects tile height/width to be multiples of `256` (DINO path uses internal `14/16` downscale).
+- `--dino-upsampler {learned,pixelshuffle,anyup}`.
+- `--dino-layers`: `last` (default) or comma-separated 1-based layers like `6,9,12`.
 - `--head-type {pointwise,dwsep,residual}`.
 - `--use-tile-cls-head` / `--no-use-tile-cls-head`.
 - `--use-fp-supervision` / `--no-use-fp-supervision`.
@@ -107,6 +119,11 @@ Common args:
 - `--hard-negative-mining`, `--hnm-hard-ratio`, `--hnm-pool-frac`.
 - `--lr`, `--lr-scheduler {none,cosine}`, `--lr-min`, `--weight-decay`.
 - `--mcc-weight`, `--mcc-warmup-epochs`, `--bce-weight`, `--boundary-weight`.
+- `--training-strategy {task_only,semantic_preserve}`.
+- Semantic-preserve knobs:
+  - `--preserve-weight`, `--preserve-warmup-epochs`
+  - `--preserve-bg-weight`, `--preserve-fg-weight`
+  - `--var-weight`, `--var-gamma`
 
 ---
 

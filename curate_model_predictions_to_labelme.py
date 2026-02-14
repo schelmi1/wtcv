@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import torchvision
 from torchvision.transforms import functional as TF
 
-from models import Stage1SegNet
+from models import Stage1SegNet, load_stage1_state_dict_compat
 from wtcv_utils.tiling import crop_with_pad, tile_origins
 
 
@@ -26,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-dir", type=Path, default=Path("data/labelme_curated_from_model"))
 
     ap.add_argument("--label", type=str, default="vehicle")
-    ap.add_argument("--tile-size", type=int, default=224)
-    ap.add_argument("--tile-stride", type=int, default=112)
+    ap.add_argument("--tile-size", type=int, default=256)
+    ap.add_argument("--tile-stride", type=int, default=128)
     ap.add_argument("--seg-out-stride", type=int, default=4)
     ap.add_argument("--pred-threshold", type=float, default=0.5)
 
@@ -59,6 +59,7 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
     ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
     fusion_channels = int(ckpt_cfg.get("fusion_channels", 256))
     dino_upsampler = str(ckpt_cfg.get("dino_upsampler_type", "learned"))
+    dino_layers = str(ckpt_cfg.get("dino_layers", "last"))
     anyup_q_chunk_size = int(ckpt_cfg.get("anyup_q_chunk_size", 256))
     head_type = str(ckpt_cfg.get("head_type", "pointwise"))
     use_tile_cls_head = bool(ckpt_cfg.get("use_tile_cls_head", False))
@@ -68,6 +69,7 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
         channels=fusion_channels,
         trust_repo=True,
         dino_upsampler_type=dino_upsampler,
+        dino_layers=dino_layers,
         anyup_q_chunk_size=anyup_q_chunk_size,
         head_type=head_type,
         use_tile_cls_head=use_tile_cls_head,
@@ -75,12 +77,19 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
     ).to(device)
 
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
+    load_stage1_state_dict_compat(
+        model,
+        state,
+        strict=False,
+        interpolate_mismatch=True,
+        verbose=True,
+    )
     model.eval()
 
     info = {
         "fusion_channels": fusion_channels,
         "dino_upsampler": dino_upsampler,
+        "dino_layers": dino_layers,
         "anyup_q_chunk_size": anyup_q_chunk_size,
         "head_type": head_type,
         "use_tile_cls_head": use_tile_cls_head,

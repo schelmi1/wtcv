@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
 from losses import mcc_bce_boundary_loss, segmentation_metrics
-from models import Stage1SegNet
+from models import Stage1SegNet, load_stage1_state_dict_compat
 from wtcv_utils.records import discover_labels, load_labelme_records
 from wtcv_utils.tiling import crop_with_pad, tile_origins
 
@@ -40,8 +40,8 @@ class Cfg:
     run_name: str
     resume_checkpoint: Optional[Path] = None
 
-    tile_size: int = 224
-    tile_stride: int = 112
+    tile_size: int = 256
+    tile_stride: int = 128
     tile_scales: str = "1.0"
 
     label_name: str = "vehicle"
@@ -60,7 +60,8 @@ class Cfg:
     weight_decay: float = 1e-4
 
     fusion_channels: int = 256
-    dino_upsampler_type: str = "learned"  # learned | anyup
+    dino_upsampler_type: str = "learned"  # learned | pixelshuffle | anyup
+    dino_layers: str = "last"  # "last" or comma-separated 1-based layers, e.g. "6,9,12"
     anyup_q_chunk_size: int = 256
     head_type: str = "pointwise"  # pointwise | dwsep | residual
     use_tile_cls_head: bool = True
@@ -91,6 +92,13 @@ class Cfg:
     mcc_warmup_epochs: int = 3
     bce_weight: float = 0.5
     boundary_weight: float = 0.2
+    training_strategy: str = "task_only"  # task_only | semantic_preserve
+    preserve_weight: float = 0.10
+    preserve_warmup_epochs: int = 3
+    preserve_bg_weight: float = 1.0
+    preserve_fg_weight: float = 0.25
+    var_weight: float = 0.01
+    var_gamma: float = 0.5
 
     trust_torch_hub_repo: bool = True
 
@@ -592,6 +600,34 @@ def make_sample_figure(
     return fig
 
 
+def semantic_preserve_losses(
+    feat_dino: torch.Tensor,
+    feat_adapted: torch.Tensor,
+    seg_target: torch.Tensor,
+    bg_weight: float,
+    fg_weight: float,
+    var_gamma: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    target_hw = (int(seg_target.shape[-2]), int(seg_target.shape[-1]))
+    d = F.interpolate(feat_dino.detach(), size=target_hw, mode="bilinear", align_corners=False)
+    a = F.interpolate(feat_adapted, size=target_hw, mode="bilinear", align_corners=False)
+
+    d_n = F.normalize(d, dim=1, eps=1e-6)
+    a_n = F.normalize(a, dim=1, eps=1e-6)
+    cos = (a_n * d_n).sum(dim=1)
+    tok_loss = 1.0 - cos
+
+    fg = (seg_target[:, 0] > 0.5).float()
+    w = float(bg_weight) * (1.0 - fg) + float(fg_weight) * fg
+    preserve = (w * tok_loss).sum() / torch.clamp(w.sum(), min=1.0)
+
+    # Small anti-collapse variance term on adapted normalized features.
+    a_flat = a_n.flatten(2)
+    std = a_flat.std(dim=2, unbiased=False)
+    var = torch.relu(float(var_gamma) - std).mean()
+    return preserve, var
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -605,6 +641,12 @@ def run_epoch(
     zoom_cls_weight: float,
     use_fp_supervision: bool,
     fp_neg_weight: float,
+    training_strategy: str,
+    preserve_weight: float,
+    preserve_bg_weight: float,
+    preserve_fg_weight: float,
+    var_weight: float,
+    var_gamma: float,
     train: bool,
     epoch: int,
     split_name: str,
@@ -624,6 +666,8 @@ def run_epoch(
     tile_cls_losses = []
     zoom_cls_losses = []
     fp_sup_losses = []
+    preserve_losses = []
+    var_losses = []
     soft_iou_scores = []
     pos_iou_scores = []
     neg_fp_rates = []
@@ -651,7 +695,8 @@ def run_epoch(
         grad_norm_val: Optional[float] = None
 
         with torch.set_grad_enabled(train):
-            pred = model(x, zoom_boxes=zoom_box)
+            use_semantic_preserve = str(training_strategy).lower() == "semantic_preserve"
+            pred = model(x, zoom_boxes=zoom_box, return_features=use_semantic_preserve)
             loss, parts = mcc_bce_boundary_loss(
                 pred["seg_logit"],
                 seg_t,
@@ -682,6 +727,28 @@ def run_epoch(
                     loss = loss + fp_neg_weight * fp_bce
                     fp_sup_val = float(fp_bce.detach().item())
             parts["fp_sup"] = fp_sup_val
+            preserve_val = float("nan")
+            var_val = float("nan")
+            if use_semantic_preserve:
+                feat_dino = pred.get("feat_dino", None)
+                feat_adapted = pred.get("feat_adapted", None)
+                if feat_dino is not None and feat_adapted is not None:
+                    l_preserve, l_var = semantic_preserve_losses(
+                        feat_dino=feat_dino,
+                        feat_adapted=feat_adapted,
+                        seg_target=seg_t,
+                        bg_weight=preserve_bg_weight,
+                        fg_weight=preserve_fg_weight,
+                        var_gamma=var_gamma,
+                    )
+                    if preserve_weight > 0:
+                        loss = loss + float(preserve_weight) * l_preserve
+                    if var_weight > 0:
+                        loss = loss + float(var_weight) * l_var
+                    preserve_val = float(l_preserve.detach().item())
+                    var_val = float(l_var.detach().item())
+            parts["preserve"] = preserve_val
+            parts["var"] = var_val
             parts["total"] = float(loss.detach().item())
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -713,6 +780,8 @@ def run_epoch(
         tile_cls_losses.append(parts["tile_cls"])
         zoom_cls_losses.append(parts["zoom_cls"])
         fp_sup_losses.append(parts["fp_sup"])
+        preserve_losses.append(parts["preserve"])
+        var_losses.append(parts["var"])
         soft_iou_scores.append(soft_iou_val)
         pos_iou_scores.append(pos_iou_val)
         neg_fp_rates.append(neg_fp_val)
@@ -751,6 +820,10 @@ def run_epoch(
                 writer.add_scalar(f"loss_step/{split_name}_zoom_cls", parts["zoom_cls"], gs)
             if not math.isnan(parts["fp_sup"]):
                 writer.add_scalar(f"loss_step/{split_name}_fp_sup", parts["fp_sup"], gs)
+            if not math.isnan(parts["preserve"]):
+                writer.add_scalar(f"loss_step/{split_name}_preserve", parts["preserve"], gs)
+            if not math.isnan(parts["var"]):
+                writer.add_scalar(f"loss_step/{split_name}_var", parts["var"], gs)
             writer.add_scalar(f"metric_step/{split_name}_soft_iou", soft_iou_val, gs)
             writer.add_scalar(f"metric_step/{split_name}_pos_iou", pos_iou_val, gs)
             writer.add_scalar(f"metric_step/{split_name}_neg_fp_rate", neg_fp_val, gs)
@@ -772,6 +845,10 @@ def run_epoch(
             postfix["grad"] = f"{grad_norm_val:.3f}"
         if not math.isnan(parts["fp_sup"]):
             postfix["fp_sup"] = f"{parts['fp_sup']:.3f}"
+        if not math.isnan(parts["preserve"]):
+            postfix["pres"] = f"{parts['preserve']:.3f}"
+        if not math.isnan(parts["var"]):
+            postfix["var"] = f"{parts['var']:.3f}"
         if dataloader_verbose:
             step_time = time.time() - now
             postfix["data_s"] = f"{data_time:.3f}"
@@ -795,6 +872,8 @@ def run_epoch(
         "tile_cls_loss": _safe_nanmean(tile_cls_losses),
         "zoom_cls_loss": _safe_nanmean(zoom_cls_losses),
         "fp_sup_loss": _safe_nanmean(fp_sup_losses),
+        "preserve_loss": _safe_nanmean(preserve_losses),
+        "var_loss": _safe_nanmean(var_losses),
         "soft_iou": _safe_nanmean(soft_iou_scores),
         "pos_iou": _safe_nanmean(pos_iou_scores),
         "neg_fp_rate": _safe_nanmean(neg_fp_rates),
@@ -819,7 +898,7 @@ def parse_tile_configs(tile_size: int, tile_stride: int, tile_scales: str) -> Li
     out = []
     seen = set()
     for s in vals:
-        ts = max(14, int(round(tile_size * s)))
+        ts = max(16, int(round(tile_size * s)))
         st = max(1, int(round(tile_stride * s)))
         key = (ts, st)
         if key not in seen:
@@ -850,6 +929,16 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Cfg):
     raise ValueError(f"Unsupported lr_scheduler: {cfg.lr_scheduler}")
 
 
+def normalize_training_strategy(value: str) -> str:
+    s = str(value).strip().lower()
+    # Backward compatibility for older configs/CLI values.
+    if s == "current":
+        s = "task_only"
+    if s not in {"task_only", "semantic_preserve"}:
+        raise ValueError(f"Unsupported training_strategy: {value}")
+    return s
+
+
 def parse_args() -> Cfg:
     ap = argparse.ArgumentParser(description="Stage-1 segmentation training (frozen DINO + local ResNet)")
 
@@ -858,8 +947,8 @@ def parse_args() -> Cfg:
     ap.add_argument("--run-name", type=str, default="")
     ap.add_argument("--resume-checkpoint", type=Path, default=None)
 
-    ap.add_argument("--tile-size", type=int, default=224)
-    ap.add_argument("--tile-stride", type=int, default=112)
+    ap.add_argument("--tile-size", type=int, default=256)
+    ap.add_argument("--tile-stride", type=int, default=128)
     ap.add_argument("--tile-scales", type=str, default="1.0", help="Comma-separated scale factors for mixed tiling, e.g. 1.0,1.5")
 
     ap.add_argument("--label", dest="label_name", type=str, default="vehicle")
@@ -880,8 +969,9 @@ def parse_args() -> Cfg:
     ap.add_argument("--weight-decay", type=float, default=1e-4)
 
     ap.add_argument("--fusion-channels", type=int, default=256)
-    ap.add_argument("--dino-upsampler", dest="dino_upsampler_type", type=str, choices=["learned", "anyup"], default="learned")
-    ap.add_argument("--dino-upsampler-type", dest="dino_upsampler_type", type=str, choices=["learned", "anyup"], help=argparse.SUPPRESS)
+    ap.add_argument("--dino-upsampler", dest="dino_upsampler_type", type=str, choices=["learned", "pixelshuffle", "anyup"], default="learned")
+    ap.add_argument("--dino-upsampler-type", dest="dino_upsampler_type", type=str, choices=["learned", "pixelshuffle", "anyup"], help=argparse.SUPPRESS)
+    ap.add_argument("--dino-layers", type=str, default="last", help="DINO layers: 'last' or comma-separated 1-based ids (e.g. 6,9,12)")
     ap.add_argument("--anyup-q-chunk-size", type=int, default=256)
     ap.add_argument("--head-type", type=str, choices=["pointwise", "dwsep", "residual"], default="pointwise")
     ap.add_argument("--use-tile-cls-head", action="store_true", default=True)
@@ -918,11 +1008,20 @@ def parse_args() -> Cfg:
     ap.add_argument("--mcc-warmup-epochs", type=int, default=3)
     ap.add_argument("--bce-weight", type=float, default=0.5)
     ap.add_argument("--boundary-weight", type=float, default=0.2)
+    ap.add_argument("--training-strategy", type=str, default="task_only")
+    ap.add_argument("--preserve-weight", type=float, default=0.10)
+    ap.add_argument("--preserve-warmup-epochs", type=int, default=3)
+    ap.add_argument("--preserve-bg-weight", type=float, default=1.0)
+    ap.add_argument("--preserve-fg-weight", type=float, default=0.25)
+    ap.add_argument("--var-weight", type=float, default=0.01)
+    ap.add_argument("--var-gamma", type=float, default=0.5)
 
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
     ap.add_argument("--no-trust-torch-hub-repo", action="store_false", dest="trust_torch_hub_repo")
 
     a = ap.parse_args()
+
+    training_strategy = normalize_training_strategy(a.training_strategy)
 
     return Cfg(
         data_dir=a.data_dir,
@@ -946,6 +1045,7 @@ def parse_args() -> Cfg:
         weight_decay=a.weight_decay,
         fusion_channels=a.fusion_channels,
         dino_upsampler_type=a.dino_upsampler_type,
+        dino_layers=a.dino_layers,
         anyup_q_chunk_size=a.anyup_q_chunk_size,
         head_type=a.head_type,
         use_tile_cls_head=a.use_tile_cls_head,
@@ -972,6 +1072,13 @@ def parse_args() -> Cfg:
         mcc_warmup_epochs=a.mcc_warmup_epochs,
         bce_weight=a.bce_weight,
         boundary_weight=a.boundary_weight,
+        training_strategy=training_strategy,
+        preserve_weight=a.preserve_weight,
+        preserve_warmup_epochs=a.preserve_warmup_epochs,
+        preserve_bg_weight=a.preserve_bg_weight,
+        preserve_fg_weight=a.preserve_fg_weight,
+        var_weight=a.var_weight,
+        var_gamma=a.var_gamma,
         trust_torch_hub_repo=a.trust_torch_hub_repo,
     )
 
@@ -1044,6 +1151,7 @@ def main() -> None:
     print(f"  batch_size={cfg.batch_size}, num_workers={cfg.num_workers}")
     print(f"  dataloader_verbose={cfg.dataloader_verbose}")
     print(f"  dino_upsampler_type={cfg.dino_upsampler_type}")
+    print(f"  dino_layers={cfg.dino_layers}")
     if cfg.dino_upsampler_type == "anyup":
         print(f"  anyup_q_chunk_size={cfg.anyup_q_chunk_size}")
         print(f"  head_type={cfg.head_type}")
@@ -1055,11 +1163,18 @@ def main() -> None:
     )
     print(f"  val_interval={cfg.val_interval}, image_log_interval={cfg.image_log_interval}")
     print(f"  iou_threshold={cfg.iou_threshold}")
+    print(f"  training_strategy={cfg.training_strategy}")
     print(
         f"  loss={cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + "
         f"{cfg.boundary_weight}*boundary + {cfg.tile_cls_weight}*tile_cls + "
         f"{cfg.zoom_cls_weight}*zoom_cls + {cfg.fp_neg_weight}*fp_sup(if enabled)"
     )
+    if cfg.training_strategy == "semantic_preserve":
+        print(
+            f"  semantic_preserve={cfg.preserve_weight}*preserve + {cfg.var_weight}*var "
+            f"(warmup={cfg.preserve_warmup_epochs}, bg_w={cfg.preserve_bg_weight}, "
+            f"fg_w={cfg.preserve_fg_weight}, var_gamma={cfg.var_gamma})"
+        )
     print(f"  mcc_warmup_epochs={cfg.mcc_warmup_epochs}")
     print(f"  lr={cfg.lr} lr_scheduler={cfg.lr_scheduler} lr_min={cfg.lr_min}")
     print(f"  augment_low_vis={cfg.augment_low_vis}")
@@ -1146,6 +1261,7 @@ def main() -> None:
         channels=cfg.fusion_channels,
         trust_repo=cfg.trust_torch_hub_repo,
         dino_upsampler_type=cfg.dino_upsampler_type,
+        dino_layers=cfg.dino_layers,
         anyup_q_chunk_size=cfg.anyup_q_chunk_size,
         head_type=cfg.head_type,
         use_tile_cls_head=cfg.use_tile_cls_head,
@@ -1187,14 +1303,13 @@ def main() -> None:
 
     if resume_blob is not None:
         state = resume_blob["model"] if isinstance(resume_blob, dict) and "model" in resume_blob else resume_blob
-        try:
-            model.load_state_dict(state, strict=True)
-        except RuntimeError as e:
-            print(
-                "warning: strict resume load failed; retrying with strict=False "
-                f"(likely architecture delta such as zoom head). error={e}"
-            )
-            model.load_state_dict(state, strict=False)
+        load_stage1_state_dict_compat(
+            model,
+            state,
+            strict=False,
+            interpolate_mismatch=True,
+            verbose=True,
+        )
         resume_cfg = resume_blob.get("cfg", {}) if isinstance(resume_blob, dict) else {}
         resume_has_zoom_head = bool(resume_cfg.get("use_zoom_cls_head", False))
         optimizer_loaded = False
@@ -1260,6 +1375,11 @@ def main() -> None:
             warmup_epochs=cfg.mcc_warmup_epochs,
             epoch=epoch,
         )
+        epoch_preserve_weight = get_epoch_mcc_weight(
+            target_weight=cfg.preserve_weight,
+            warmup_epochs=cfg.preserve_warmup_epochs,
+            epoch=epoch,
+        )
         if cfg.hard_negative_mining:
             epoch_indices = train_ds.build_epoch_indices_for_hnm(
                 epoch=epoch,
@@ -1295,6 +1415,12 @@ def main() -> None:
             zoom_cls_weight=cfg.zoom_cls_weight,
             use_fp_supervision=cfg.use_fp_supervision,
             fp_neg_weight=cfg.fp_neg_weight,
+            training_strategy=cfg.training_strategy,
+            preserve_weight=epoch_preserve_weight,
+            preserve_bg_weight=cfg.preserve_bg_weight,
+            preserve_fg_weight=cfg.preserve_fg_weight,
+            var_weight=cfg.var_weight,
+            var_gamma=cfg.var_gamma,
             train=True,
             epoch=epoch,
             split_name="train",
@@ -1315,6 +1441,8 @@ def main() -> None:
             "tile_cls_loss": float("nan"),
             "zoom_cls_loss": float("nan"),
             "fp_sup_loss": float("nan"),
+            "preserve_loss": float("nan"),
+            "var_loss": float("nan"),
             "soft_iou": float("nan"),
             "pos_iou": float("nan"),
             "neg_fp_rate": float("nan"),
@@ -1335,6 +1463,12 @@ def main() -> None:
                 zoom_cls_weight=cfg.zoom_cls_weight,
                 use_fp_supervision=cfg.use_fp_supervision,
                 fp_neg_weight=cfg.fp_neg_weight,
+                training_strategy=cfg.training_strategy,
+                preserve_weight=epoch_preserve_weight,
+                preserve_bg_weight=cfg.preserve_bg_weight,
+                preserve_fg_weight=cfg.preserve_fg_weight,
+                var_weight=cfg.var_weight,
+                var_gamma=cfg.var_gamma,
                 train=False,
                 epoch=epoch,
                 split_name="val",
@@ -1351,6 +1485,8 @@ def main() -> None:
             "train_tile_cls_loss": tr["tile_cls_loss"],
             "train_zoom_cls_loss": tr["zoom_cls_loss"],
             "train_fp_sup_loss": tr["fp_sup_loss"],
+            "train_preserve_loss": tr["preserve_loss"],
+            "train_var_loss": tr["var_loss"],
             "train_iou": tr["soft_iou"],
             "train_pos_iou": tr["pos_iou"],
             "train_neg_fp_rate": tr["neg_fp_rate"],
@@ -1359,6 +1495,8 @@ def main() -> None:
             "val_tile_cls_loss": va["tile_cls_loss"],
             "val_zoom_cls_loss": va["zoom_cls_loss"],
             "val_fp_sup_loss": va["fp_sup_loss"],
+            "val_preserve_loss": va["preserve_loss"],
+            "val_var_loss": va["var_loss"],
             "val_iou": va["soft_iou"],
             "val_pos_iou": va["pos_iou"],
             "val_neg_fp_rate": va["neg_fp_rate"],
@@ -1370,13 +1508,16 @@ def main() -> None:
             f"epoch={epoch:02d} "
             f"lr={lr_now:.8f} "
             f"mcc_w={epoch_mcc_weight:.4f} "
+            f"pres_w={epoch_preserve_weight:.4f} "
             f"train_total={row['train_total']:.4f} train_tile_cls={row['train_tile_cls_loss']:.4f} "
             f"train_zoom_cls={row['train_zoom_cls_loss']:.4f} train_fp_sup={row['train_fp_sup_loss']:.4f} "
+            f"train_pres={row['train_preserve_loss']:.4f} train_var={row['train_var_loss']:.4f} "
             f"train_iou={row['train_iou']:.4f} "
             f"train_pos_iou={row['train_pos_iou']:.4f} train_neg_fp={row['train_neg_fp_rate']:.4f} "
             f"train_fp_act={row['train_fp_activation']:.4f} "
             f"val_total={row['val_total']:.4f} val_tile_cls={row['val_tile_cls_loss']:.4f} "
             f"val_zoom_cls={row['val_zoom_cls_loss']:.4f} val_fp_sup={row['val_fp_sup_loss']:.4f} "
+            f"val_pres={row['val_preserve_loss']:.4f} val_var={row['val_var_loss']:.4f} "
             f"val_iou={row['val_iou']:.4f} "
             f"val_pos_iou={row['val_pos_iou']:.4f} val_neg_fp={row['val_neg_fp_rate']:.4f} "
             f"val_fp_act={row['val_fp_activation']:.4f}"
@@ -1384,6 +1525,7 @@ def main() -> None:
 
         writer.add_scalar("lr/epoch", lr_now, epoch)
         writer.add_scalar("loss_cfg/mcc_weight", epoch_mcc_weight, epoch)
+        writer.add_scalar("loss_cfg/preserve_weight", epoch_preserve_weight, epoch)
         writer.add_scalar("metric/train_soft_iou", row["train_iou"], epoch)
         writer.add_scalar("metric/train_pos_iou", row["train_pos_iou"], epoch)
         writer.add_scalar("metric/train_neg_fp_rate", row["train_neg_fp_rate"], epoch)
@@ -1395,6 +1537,10 @@ def main() -> None:
             writer.add_scalar("loss_epoch/train_zoom_cls", row["train_zoom_cls_loss"], epoch)
         if not math.isnan(row["train_fp_sup_loss"]):
             writer.add_scalar("loss_epoch/train_fp_sup", row["train_fp_sup_loss"], epoch)
+        if not math.isnan(row["train_preserve_loss"]):
+            writer.add_scalar("loss_epoch/train_preserve", row["train_preserve_loss"], epoch)
+        if not math.isnan(row["train_var_loss"]):
+            writer.add_scalar("loss_epoch/train_var", row["train_var_loss"], epoch)
         # Backward-compatible alias: mask_iou now reports soft_iou.
         writer.add_scalar("metric/train_mask_iou", row["train_iou"], epoch)
         if epoch % cfg.val_interval == 0:
@@ -1409,6 +1555,10 @@ def main() -> None:
                 writer.add_scalar("loss_epoch/val_zoom_cls", row["val_zoom_cls_loss"], epoch)
             if not math.isnan(row["val_fp_sup_loss"]):
                 writer.add_scalar("loss_epoch/val_fp_sup", row["val_fp_sup_loss"], epoch)
+            if not math.isnan(row["val_preserve_loss"]):
+                writer.add_scalar("loss_epoch/val_preserve", row["val_preserve_loss"], epoch)
+            if not math.isnan(row["val_var_loss"]):
+                writer.add_scalar("loss_epoch/val_var", row["val_var_loss"], epoch)
             # Backward-compatible alias: mask_iou now reports soft_iou.
             writer.add_scalar("metric/val_mask_iou", row["val_iou"], epoch)
 

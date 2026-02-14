@@ -16,7 +16,7 @@ import torchvision
 from torchvision.transforms import functional as TF
 from tqdm.auto import tqdm
 
-from models import Stage1SegNet
+from models import Stage1SegNet, load_stage1_state_dict_compat
 from wtcv_utils.records import load_labelme_records
 from wtcv_utils.tiling import crop_with_pad, tile_origins
 
@@ -25,8 +25,8 @@ from wtcv_utils.tiling import crop_with_pad, tile_origins
 class EvalCfg:
     data_dir: Path
     checkpoint: Path
-    tile_size: int = 224
-    tile_stride: int = 112
+    tile_size: int = 256
+    tile_stride: int = 128
     seg_out_stride: int = 4
     label_name: str = "vehicle"
     min_poly_points: int = 3
@@ -43,8 +43,8 @@ def parse_args() -> EvalCfg:
     ap = argparse.ArgumentParser(description="Evaluate stage1 segmentation checkpoint")
     ap.add_argument("--data-dir", type=Path, default=Path("data/record_pairs"))
     ap.add_argument("--checkpoint", type=Path, required=True)
-    ap.add_argument("--tile-size", type=int, default=224)
-    ap.add_argument("--tile-stride", type=int, default=112)
+    ap.add_argument("--tile-size", type=int, default=256)
+    ap.add_argument("--tile-stride", type=int, default=128)
     ap.add_argument("--seg-out-stride", type=int, default=4)
     ap.add_argument("--label-name", type=str, default="vehicle")
     ap.add_argument("--min-poly-points", type=int, default=3)
@@ -309,6 +309,7 @@ def main() -> None:
     ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
     model_channels = int(ckpt_cfg.get("fusion_channels", cfg.fusion_channels))
     dino_upsampler_type = str(ckpt_cfg.get("dino_upsampler_type", "learned"))
+    dino_layers = str(ckpt_cfg.get("dino_layers", "last"))
     anyup_q_chunk_size = int(ckpt_cfg.get("anyup_q_chunk_size", 256))
     head_type = str(ckpt_cfg.get("head_type", "pointwise"))
     use_tile_cls_head = bool(ckpt_cfg.get("use_tile_cls_head", False))
@@ -318,13 +319,20 @@ def main() -> None:
         channels=model_channels,
         trust_repo=cfg.trust_torch_hub_repo,
         dino_upsampler_type=dino_upsampler_type,
+        dino_layers=dino_layers,
         anyup_q_chunk_size=anyup_q_chunk_size,
         head_type=head_type,
         use_tile_cls_head=use_tile_cls_head,
         use_zoom_cls_head=use_zoom_cls_head,
     ).to(device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
+    load_stage1_state_dict_compat(
+        model,
+        state,
+        strict=False,
+        interpolate_mismatch=True,
+        verbose=True,
+    )
     model.eval()
 
     records = load_labelme_records(
