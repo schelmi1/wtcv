@@ -4,3 +4,4 @@ runs/
 __pycache__
 videos/
 *.ipynb
+.pytest_cache/

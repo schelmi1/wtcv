@@ -19,6 +19,16 @@ Shared utilities now live in:
   - `tile_origins(...)`
   - `crop_with_pad(...)`
 
+Core model/loss modules:
+- `models.py`
+  - `Stage1SegNet`
+  - frozen DINO + learned/AnyUp branches
+  - segmentation + tile/zoom classifier heads
+- `losses.py`
+  - `mcc_bce_boundary_loss(...)`
+  - `segmentation_metrics(...)`
+  - MCC/boundary helper losses
+
 Scripts migrated to use these shared helpers:
 - `wtcv_gradio_app.py`
 - `augment_record_pairs_with_polygons.py`
@@ -30,7 +40,7 @@ Scripts migrated to use these shared helpers:
 - `eval_stage1_seg.py`
 - `curate_model_predictions_to_labelme.py`
 
-This reduces duplicated geometry/path logic and keeps app + data tools consistent.
+This removes duplicated geometry/path logic, centralizes model/loss definitions, and keeps app + data tools consistent.
 
 ## WTCV Studio (Gradio App)
 
@@ -43,6 +53,9 @@ Purpose:
   - SAM bbox->polygon conversion
   - Dataset augmentation
   - Curation launcher (OpenCV window)
+  - Media-source inference (folder/video, optional UI)
+  - Live screen inference (OpenCV UI)
+  - Object UMAP + FiftyOne export
   - Single-image tiled inference preview
   - Dataset peek/stats
   - Video -> frames extraction
@@ -81,7 +94,7 @@ Common args:
 - `--epochs`: number of epochs (resume adds on top of loaded epoch).
 - `--label`: target label (case-insensitive).
 - `--fp-label`: false-positive annotation label (default `fp`, case-insensitive).
-- `--subset-size`: limit records before train/val split.
+- `--subset-size`: final train tile subset size (applied after tile build + balancing).
 - `--batch-size`, `--num-workers`.
 - `--tile-size`, `--tile-stride`, `--tile-scales`.
 - `--dino-upsampler {learned,anyup}`.
@@ -322,4 +335,5 @@ python augment_record_pairs_with_polygons.py --help
 python fiftyone_object_umap.py --help
 python fiftyone_export_tagged_to_labelme.py --help
 python media_source_inference_cv2.py --help
+python live_screen_inference_cv2.py --help
 ```
