@@ -5,3 +5,7 @@ __pycache__
 videos/
 *.ipynb
 .pytest_cache/
+tools/vit_explorer/frontend/node_modules/
+tools/vit_explorer/frontend/dist/
+tools/vit_explorer/frontend/.vite/
+tools/vit_explorer/**/__pycache__/

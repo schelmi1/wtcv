@@ -79,6 +79,40 @@ Run:
 python wtcv_gradio_app.py --host 127.0.0.1 --port 7860
 ```
 
+## ViT Explorer Tool (Isolated)
+
+Location:
+- `tools/vit_explorer/`
+
+Purpose:
+- Interactive ViT token explorer (FastAPI backend + React/Vite frontend).
+- Supports vanilla `dinov2_vits14_reg` tokens and optional Stage1 fused adapter features from WTCV checkpoints.
+
+Install and run:
+```bash
+# backend
+cd tools/vit_explorer/backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+```bash
+# frontend (new terminal)
+cd tools/vit_explorer/frontend
+npm install
+npm run dev
+```
+
+Open:
+- Frontend: `http://127.0.0.1:5173`
+- Backend: `http://127.0.0.1:8000`
+
+Notes:
+- Kept isolated from existing WTCV training/inference code paths to avoid regressions.
+- `node_modules` and frontend build artifacts are ignored by `.gitignore`.
+
 ## Main Entry Points
 
 ### 1) Train stage-1 segmentation
