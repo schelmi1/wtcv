@@ -43,7 +43,7 @@ Trainable modules: dino_up, fuse_1x1, head.
 4) Model Architecture (Stage 1)
 
 DINO branch:
-dinov2_vits14 patch tokens from forward_features()["x_norm_patchtokens"].
+dinov2_vits14_reg patch tokens from forward_features()["x_norm_patchtokens"].
 Projected by 1x1 conv to fusion_channels (default 256).
 Learned upsampler:
 2 blocks of upsample + conv + GELU, then size-align to local feature map.

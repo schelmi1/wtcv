@@ -87,7 +87,7 @@ def mock_model_deps(monkeypatch: pytest.MonkeyPatch):
     def fake_hub_load(repo_or_dir, model, *args, **kwargs):
         _ = (args, kwargs)
         if repo_or_dir == "facebookresearch/dinov2":
-            assert model == "dinov2_vits14"
+            assert model == "dinov2_vits14_reg"
             return _FakeDinoBackbone()
         if repo_or_dir == "wimmerth/anyup":
             assert model == "anyup"

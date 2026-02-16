@@ -18,7 +18,6 @@ def run_object_umap(
     tile_size: int,
     tile_context_scale: float,
     batch_size: int,
-    dino_model: str,
     device: str,
     umap_n_neighbors: int,
     umap_min_dist: float,
@@ -52,8 +51,6 @@ def run_object_umap(
         str(float(tile_context_scale)),
         "--batch-size",
         str(int(batch_size)),
-        "--dino-model",
-        dino_model,
         "--device",
         str(device),
         "--umap-n-neighbors",
@@ -111,7 +108,6 @@ def build_tab(root: Path) -> None:
             fo_context = gr.Number(value=2.0, label="Tile Context Scale", info="Object crop context multiplier relative to object bbox size.")
             fo_batch = gr.Number(value=12, precision=0, label="DINO Batch Size", info="Batch size used while extracting DINO embeddings.")
         with gr.Row():
-            fo_dino_model = gr.Textbox(value="dinov2_vits14", label="DINO Model", info="Torch hub DINOv2 model name used for feature extraction.")
             fo_device = gr.Textbox(value="", label="Device (blank=auto)", info="Compute device override; leave blank for automatic selection.")
             fo_umap_neighbors = gr.Number(value=30, precision=0, label="UMAP n_neighbors", info="UMAP neighborhood size controlling local/global manifold balance.")
             fo_umap_min_dist = gr.Number(value=0.05, label="UMAP min_dist", info="UMAP minimum embedding distance; lower values produce tighter clusters.")
@@ -136,7 +132,6 @@ def build_tab(root: Path) -> None:
                 fo_tile_size,
                 fo_context,
                 fo_batch,
-                fo_dino_model,
                 fo_device,
                 fo_umap_neighbors,
                 fo_umap_min_dist,

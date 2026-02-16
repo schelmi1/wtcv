@@ -43,6 +43,7 @@ Scripts migrated to use these shared helpers:
 - `augment_record_pairs_with_polygons.py`
 - `sam1_box_to_poly_batched.py`
 - `fiftyone_object_umap.py`
+- `build_embedding_bank.py`
 - `fiftyone_export_tagged_to_labelme.py`
 - `media_source_inference_cv2.py`
 - `train_stage1_seg.py`
@@ -65,6 +66,7 @@ Purpose:
   - Media-source inference (folder/video, optional UI)
   - Live screen inference (OpenCV UI)
   - Object UMAP + FiftyOne export
+  - Embedding bank builder (from LabelMe folders)
   - Single-image tiled inference preview
   - Dataset peek/stats
   - Video -> frames extraction
@@ -299,7 +301,7 @@ Common args:
 - `--output-dir`: saved object crops + `embeddings_umap.npz`.
 - `--label-filter`: comma-separated labels, case-insensitive.
 - `--tile-size`, `--tile-context-scale`.
-- `--dino-model` (default `dinov2_vits14`), `--batch-size`, `--device`.
+- DINO backbone is fixed to `dinov2_vits14_reg` in app/script workflows, plus `--batch-size`, `--device`.
 - `--umap-n-neighbors`, `--umap-min-dist`, `--umap-metric`.
 - `--num-clusters`: KMeans clusters in UMAP space.
 - `--overwrite-dataset`, `--launch`.
@@ -330,7 +332,32 @@ Common args:
 
 ---
 
-### 8) Media Source Inference (folder or video)
+### 8) Build Embedding Bank (LabelMe folder -> reusable vectors)
+Script: `build_embedding_bank.py`
+
+Purpose:
+- Build masked DINO object embeddings from LabelMe image/json pairs.
+- Save reusable bank artifacts for similarity search / reference matching.
+
+Example:
+```bash
+python build_embedding_bank.py \
+  --input-dir /home/schelli/git/wtcv/data/record_pairs \
+  --output-dir /home/schelli/git/wtcv/outputs/embedding_bank \
+  --label-filter vehicle \
+  --tile-size 448 \
+  --tile-context-scale 2.0
+```
+
+Outputs:
+- `embedding_bank.npz` (embeddings + numeric label/object fields)
+- `embedding_bank_meta.jsonl` (per-object metadata rows)
+- `embedding_prototypes.npz` (mean normalized prototype per label)
+- `embedding_bank_manifest.json` (run config + file index)
+
+---
+
+### 9) Media Source Inference (folder or video)
 Script: `media_source_inference_cv2.py`
 
 Purpose:
@@ -355,6 +382,31 @@ Common args:
 - `--tile-size`, `--tile-stride`, `--pred-threshold`.
 - `--use-tile-cls-gating`, `--tile-cls-threshold`, `--tile-cls-mode`.
 - `--infer-every`, `--max-fps`, `--start-index`, `--max-items`.
+
+---
+
+### 10) Object Cosine Similarity Report (LabelMe folder)
+Script: `report_object_cosine_similarity.py`
+
+Purpose:
+- Compute masked DINO embeddings for objects in a LabelMe folder.
+- Report highest and lowest cosine-similarity object pairs.
+
+Example:
+```bash
+python report_object_cosine_similarity.py \
+  --input-dir /home/schelli/git/wtcv/data/record_pairs \
+  --output-dir /home/schelli/git/wtcv/outputs/embedding_similarity \
+  --label-filter vehicle \
+  --top-k 25
+```
+
+Outputs:
+- `cosine_similarity_report.json` (summary + high/low pairs)
+- `cosine_similarity_pairs.csv` (tabular high/low pairs)
+- `cosine_similarity_embeddings.npz` (computed embeddings)
+- `top_pairs/` (only copied LabelMe image/json pairs for highest-cosine pairs)
+- `bottom_pairs/` (only copied LabelMe image/json pairs for lowest-cosine pairs)
 
 ## Notebooks
 
@@ -384,6 +436,8 @@ python curate_model_predictions_to_labelme.py --help
 python sam1_box_to_poly_batched.py --help
 python augment_record_pairs_with_polygons.py --help
 python fiftyone_object_umap.py --help
+python build_embedding_bank.py --help
+python report_object_cosine_similarity.py --help
 python fiftyone_export_tagged_to_labelme.py --help
 python media_source_inference_cv2.py --help
 python live_screen_inference_cv2.py --help

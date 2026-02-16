@@ -19,7 +19,7 @@ class FrozenDinoTokenBranch(nn.Module):
     ):
         super().__init__()
         self.backbone = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_vits14", trust_repo=trust_repo
+            "facebookresearch/dinov2", "dinov2_vits14_reg", trust_repo=trust_repo
         )
         for p in self.backbone.parameters():
             p.requires_grad = False

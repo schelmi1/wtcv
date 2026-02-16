@@ -121,44 +121,51 @@ def single_image_infer(
     return poly_view[:, :, ::-1], heat_overlay[:, :, ::-1], mask_vis, json.dumps(report, indent=2)
 
 
-def build_tab() -> None:
+def build_content() -> None:
+    with gr.Row():
+        infer_image_path = gr.Textbox(value="", label="Image Path", info="Path to the single image to run inference on.")
+        infer_ckpt = gr.Textbox(value="", label="Checkpoint", info="Path to a trained model checkpoint (.pt) to load for inference/evaluation.")
+        infer_label = gr.Textbox(value="vehicle", label="Label", info="Class label name used for output polygons and evaluation target.")
+    with gr.Row():
+        infer_tile = gr.Number(value=256, precision=0, label="Tile Size", info="Side length of each square inference/training tile in pixels.")
+        infer_stride = gr.Number(value=128, precision=0, label="Tile Stride", info="Step size between tile origins; lower values add overlap and compute cost.")
+        infer_seg_stride = gr.Number(value=4, precision=0, label="Seg Out Stride", info="Output stride of segmentation logits relative to tile resolution.")
+        infer_thr = gr.Number(value=0.5, label="Pred Threshold", info="Probability threshold used to convert logits/probabilities into a binary mask.")
+    with gr.Row():
+        infer_gate = gr.Dropdown(choices=["on", "off"], value="on", label="Use Tile Cls Gating", info="If on, tile classification score gates segmentation output per tile.")
+        infer_tile_cls_thr = gr.Number(value=0.5, label="Tile Cls Threshold", info="Minimum tile classification confidence required for gating.")
+        infer_tile_cls_mode = gr.Dropdown(choices=["hard", "multiply"], value="hard", label="Tile Cls Mode", info="Gating behavior: hard masking or probability multiplication.")
+        infer_min_poly = gr.Number(value=20.0, label="Min Poly Area", info="Minimum polygon area kept during mask-to-polygon conversion.")
+        infer_eps = gr.Number(value=0.002, label="Poly Epsilon", info="Polygon simplification epsilon fraction used by contour approximation.")
+    infer_btn = gr.Button("Run Inference", variant="primary")
+    with gr.Row():
+        infer_poly_img = gr.Image(label="Polygons Overlay", type="numpy")
+        infer_heat_img = gr.Image(label="Heatmap Overlay", type="numpy")
+        infer_mask_img = gr.Image(label="Pred Mask", type="numpy")
+    infer_report = gr.Textbox(label="Inference Report", lines=22, elem_classes=["mono"])
+    infer_btn.click(
+        fn=single_image_infer,
+        inputs=[
+            infer_image_path,
+            infer_ckpt,
+            infer_label,
+            infer_tile,
+            infer_stride,
+            infer_seg_stride,
+            infer_thr,
+            infer_gate,
+            infer_tile_cls_thr,
+            infer_tile_cls_mode,
+            infer_min_poly,
+            infer_eps,
+        ],
+        outputs=[infer_poly_img, infer_heat_img, infer_mask_img, infer_report],
+    )
+
+
+def build_tab(nested: bool = False) -> None:
+    if nested:
+        build_content()
+        return
     with gr.Tab("Single Image Inference"):
-        with gr.Row():
-            infer_image_path = gr.Textbox(value="", label="Image Path", info="Path to the single image to run inference on.")
-            infer_ckpt = gr.Textbox(value="", label="Checkpoint", info="Path to a trained model checkpoint (.pt) to load for inference/evaluation.")
-            infer_label = gr.Textbox(value="vehicle", label="Label", info="Class label name used for output polygons and evaluation target.")
-        with gr.Row():
-            infer_tile = gr.Number(value=256, precision=0, label="Tile Size", info="Side length of each square inference/training tile in pixels.")
-            infer_stride = gr.Number(value=128, precision=0, label="Tile Stride", info="Step size between tile origins; lower values add overlap and compute cost.")
-            infer_seg_stride = gr.Number(value=4, precision=0, label="Seg Out Stride", info="Output stride of segmentation logits relative to tile resolution.")
-            infer_thr = gr.Number(value=0.5, label="Pred Threshold", info="Probability threshold used to convert logits/probabilities into a binary mask.")
-        with gr.Row():
-            infer_gate = gr.Dropdown(choices=["on", "off"], value="on", label="Use Tile Cls Gating", info="If on, tile classification score gates segmentation output per tile.")
-            infer_tile_cls_thr = gr.Number(value=0.5, label="Tile Cls Threshold", info="Minimum tile classification confidence required for gating.")
-            infer_tile_cls_mode = gr.Dropdown(choices=["hard", "multiply"], value="hard", label="Tile Cls Mode", info="Gating behavior: hard masking or probability multiplication.")
-            infer_min_poly = gr.Number(value=20.0, label="Min Poly Area", info="Minimum polygon area kept during mask-to-polygon conversion.")
-            infer_eps = gr.Number(value=0.002, label="Poly Epsilon", info="Polygon simplification epsilon fraction used by contour approximation.")
-        infer_btn = gr.Button("Run Inference", variant="primary")
-        with gr.Row():
-            infer_poly_img = gr.Image(label="Polygons Overlay", type="numpy")
-            infer_heat_img = gr.Image(label="Heatmap Overlay", type="numpy")
-            infer_mask_img = gr.Image(label="Pred Mask", type="numpy")
-        infer_report = gr.Textbox(label="Inference Report", lines=22, elem_classes=["mono"])
-        infer_btn.click(
-            fn=single_image_infer,
-            inputs=[
-                infer_image_path,
-                infer_ckpt,
-                infer_label,
-                infer_tile,
-                infer_stride,
-                infer_seg_stride,
-                infer_thr,
-                infer_gate,
-                infer_tile_cls_thr,
-                infer_tile_cls_mode,
-                infer_min_poly,
-                infer_eps,
-            ],
-            outputs=[infer_poly_img, infer_heat_img, infer_mask_img, infer_report],
-        )
+        build_content()

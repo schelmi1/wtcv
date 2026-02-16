@@ -658,35 +658,38 @@ def make_sample_figure(
         pred = model(x)
         seg_p = torch.sigmoid(pred["seg_logit"]).detach().cpu()
 
-    fig, axes = plt.subplots(n, 4, figsize=(14, 3.2 * n))
+    fig, axes = plt.subplots(n, 2, figsize=(9.5, 3.6 * n))
     if n == 1:
         axes = np.expand_dims(axes, axis=0)
 
+    pred_poly_thr = 0.5
     for i in range(n):
         img = unnormalize_image(x[i].detach().cpu())
         gt = seg_t[i, 0].numpy()
         pr = seg_p[i, 0].numpy()
         gt_up = upsample_map_to_image(gt, img.shape[:2])
         pr_up = upsample_map_to_image(pr, img.shape[:2])
-        lb = (pr_up > thr).astype(np.float32)
-
-        axes[i, 0].imshow(img)
-        axes[i, 0].set_title(
-            f"{title_prefix} tile\nobjs={metas[i]['num_objects']} fg={int((gt_up > 0).any())}"
+        # Left: image + GT polygon-like contour overlay.
+        ax_l = axes[i, 0]
+        ax_l.imshow(img)
+        gt_min = float(np.min(gt_up))
+        gt_max = float(np.max(gt_up))
+        if gt_min <= 0.5 <= gt_max:
+            ax_l.contour(gt_up, levels=[0.5], colors=["#00ffd5"], linewidths=1.6)
+        ax_l.set_title(
+            f"{title_prefix} | GT poly\nobjs={metas[i]['num_objects']} fg={int((gt_up > 0).any())}"
         )
-        axes[i, 0].axis("off")
+        ax_l.axis("off")
 
-        axes[i, 1].imshow(gt_up, cmap="magma", vmin=0.0, vmax=1.0)
-        axes[i, 1].set_title("GT seg")
-        axes[i, 1].axis("off")
-
-        axes[i, 2].imshow(pr_up, cmap="magma", vmin=0.0, vmax=1.0)
-        axes[i, 2].set_title("Pred prob")
-        axes[i, 2].axis("off")
-
-        axes[i, 3].imshow(lb, cmap="gray", vmin=0.0, vmax=1.0)
-        axes[i, 3].set_title(f"Pred mask thr={thr}")
-        axes[i, 3].axis("off")
+        # Right: prediction heatmap + predicted polyline at fixed threshold 0.5.
+        ax_r = axes[i, 1]
+        ax_r.imshow(pr_up, cmap="magma", vmin=0.0, vmax=1.0)
+        pr_min = float(np.min(pr_up))
+        pr_max = float(np.max(pr_up))
+        if pr_min <= pred_poly_thr <= pr_max:
+            ax_r.contour(pr_up, levels=[pred_poly_thr], colors=["#00ffff"], linewidths=1.6)
+        ax_r.set_title(f"Pred heatmap + poly@{pred_poly_thr:.1f}")
+        ax_r.axis("off")
 
     plt.tight_layout()
     return fig

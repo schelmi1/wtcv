@@ -40,6 +40,8 @@ except Exception as e:  # pragma: no cover
 from wtcv_utils.labelme import polygon_area, polygon_bbox, shape_to_points
 from wtcv_utils.records import load_labelme_pairs
 
+FIXED_DINO_MODEL = "dinov2_vits14_reg"
+
 
 @dataclass
 class ObjMeta:
@@ -70,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-poly-points", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=12)
 
-    ap.add_argument("--dino-model", type=str, default="dinov2_vits14")
+    ap.add_argument("--dino-model", type=str, default=FIXED_DINO_MODEL)
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
     ap.add_argument("--no-trust-torch-hub-repo", action="store_false", dest="trust_torch_hub_repo")
     ap.add_argument("--device", type=str, default="", help="cuda|cpu; default auto")
@@ -349,6 +351,9 @@ def main() -> None:
     args = parse_args()
     if not args.input_dir.exists():
         raise FileNotFoundError(f"Missing input dir: {args.input_dir}")
+    if str(args.dino_model).strip() != FIXED_DINO_MODEL:
+        print(f"forcing_dino_model={FIXED_DINO_MODEL} (requested={args.dino_model})")
+        args.dino_model = FIXED_DINO_MODEL
 
     device = torch.device(args.device) if str(args.device).strip() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = [x.strip() for x in str(args.label_filter).split(",") if x.strip()]
