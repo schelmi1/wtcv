@@ -305,7 +305,10 @@ def add_to_fiftyone(
         s = fo.Sample(filepath=str(m.crop_path))
         s["source_image_path"] = str(m.source_image)
         s["source_json_path"] = str(m.source_json)
-        s["source_obj_idx"] = int(m.source_obj_idx)
+        # Keep UI-facing index 1-based, and store explicit 0-based index for robust programmatic lookup.
+        s["source_obj_idx"] = int(m.source_obj_idx) + 1
+        s["source_obj_idx0"] = int(m.source_obj_idx)
+        s["source_obj_num"] = int(m.source_obj_idx) + 1
         s["source_label"] = str(m.source_label)
         s["area_ratio"] = float(m.area_ratio)
         s["object_bbox"] = fo.Detections(detections=[det])

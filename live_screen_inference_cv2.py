@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--height", type=int, default=0, help="Capture region height; 0 means full monitor height")
     ap.add_argument("--print-monitors", action="store_true", default=False)
 
-    ap.add_argument("--tile-size", type=int, default=448)
-    ap.add_argument("--tile-stride", type=int, default=448)
+    ap.add_argument("--tile-size", type=int, default=512)
+    ap.add_argument("--tile-stride", type=int, default=512)
     ap.add_argument("--seg-out-stride", type=int, default=4)
     ap.add_argument("--pred-threshold", type=float, default=0.5)
 

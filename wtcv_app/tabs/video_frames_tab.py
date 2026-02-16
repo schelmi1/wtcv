@@ -43,10 +43,10 @@ def run_extract_frames(
 def build_tab(root: Path) -> None:
     with gr.Tab("Video -> Frames"):
         with gr.Row():
-            vid_path = gr.Textbox(value="", label="Video Path")
-            vid_out = gr.Textbox(value=str(root / "videos/frames_2fps"), label="Output Frames Dir")
-            vid_fps = gr.Number(value=2.0, label="FPS")
-            vid_overwrite = gr.Dropdown(choices=["on", "off"], value="off", label="Overwrite Existing Frames")
+            vid_path = gr.Textbox(value="", label="Video Path", info="Path to the source video file passed to ffmpeg.")
+            vid_out = gr.Textbox(value=str(root / "videos/frames_2fps"), label="Output Frames Dir", info="Directory where extracted frame images are written.")
+            vid_fps = gr.Number(value=2.0, label="FPS", info="Target frame extraction rate (frames per second).")
+            vid_overwrite = gr.Dropdown(choices=["on", "off"], value="off", label="Overwrite Existing Frames", info="If on, existing files in the output frames directory can be replaced.")
         vid_btn = gr.Button("Extract Frames", variant="primary")
         vid_cmd = gr.Textbox(label="Command", interactive=False)
         vid_logs = gr.Textbox(label="Live Logs", lines=20, elem_classes=["mono"], interactive=False)
