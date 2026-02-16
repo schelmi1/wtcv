@@ -61,6 +61,7 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
     dino_upsampler = str(ckpt_cfg.get("dino_upsampler_type", "learned"))
     dino_layers = str(ckpt_cfg.get("dino_layers", "last"))
     anyup_q_chunk_size = int(ckpt_cfg.get("anyup_q_chunk_size", 256))
+    local_backbone = str(ckpt_cfg.get("local_backbone", "resnet18"))
     head_type = str(ckpt_cfg.get("head_type", "pointwise"))
     use_tile_cls_head = bool(ckpt_cfg.get("use_tile_cls_head", False))
     use_zoom_cls_head = bool(ckpt_cfg.get("use_zoom_cls_head", False))
@@ -71,6 +72,7 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
         dino_upsampler_type=dino_upsampler,
         dino_layers=dino_layers,
         anyup_q_chunk_size=anyup_q_chunk_size,
+        local_backbone=local_backbone,
         head_type=head_type,
         use_tile_cls_head=use_tile_cls_head,
         use_zoom_cls_head=use_zoom_cls_head,
@@ -91,6 +93,7 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
         "dino_upsampler": dino_upsampler,
         "dino_layers": dino_layers,
         "anyup_q_chunk_size": anyup_q_chunk_size,
+        "local_backbone": local_backbone,
         "head_type": head_type,
         "use_tile_cls_head": use_tile_cls_head,
         "use_zoom_cls_head": use_zoom_cls_head,

@@ -26,6 +26,8 @@ def run_train(
     dino_upsampler: str,
     dino_layers: str,
     anyup_q_chunk_size: int,
+    local_backbone: str,
+    local_unfreeze: str,
     head_type: str,
     use_tile_cls_head: bool,
     tile_cls_weight: float,
@@ -96,6 +98,10 @@ def run_train(
         str(dino_layers),
         "--anyup-q-chunk-size",
         str(int(anyup_q_chunk_size)),
+        "--local-backbone",
+        str(local_backbone),
+        "--local-unfreeze",
+        str(local_unfreeze),
         "--head-type",
         head_type,
         "--tile-cls-weight",
@@ -167,59 +173,62 @@ def build_tab(root: Path) -> None:
 
     with gr.Tab("Train"):
         with gr.Row():
-            data_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Data Dir")
-            output_dir = gr.Textbox(value=str(root / "runs"), label="Output Dir")
+            data_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Data Dir", info="Directory containing training/evaluation LabelMe data pairs.")
+            output_dir = gr.Textbox(value=str(root / "runs"), label="Output Dir", info="Directory where generated outputs are written.")
         with gr.Row():
-            run_name = gr.Textbox(value="", label="Run Name")
-            resume_ckpt = gr.Textbox(value="", label="Resume Checkpoint (optional)")
+            run_name = gr.Textbox(value="", label="Run Name", info="Optional run subfolder name; leave blank for auto-generated name.")
+            resume_ckpt = gr.Textbox(value="", label="Resume Checkpoint (optional)", info="Optional checkpoint path to resume training state from.")
         with gr.Row():
-            epochs = gr.Number(value=5, precision=0, label="Epochs")
-            subset_size = gr.Number(value=0, precision=0, label="Subset Size (0=all)")
-            label = gr.Textbox(value="vehicle", label="Label")
-            fp_label = gr.Textbox(value="fp", label="FP Label")
+            epochs = gr.Number(value=5, precision=0, label="Epochs", info="Number of full training passes over the dataset.")
+            subset_size = gr.Number(value=0, precision=0, label="Subset Size (0=all)", info="Optional sample cap for quicker experiments; 0 uses the full dataset.")
+            label = gr.Textbox(value="vehicle", label="Label", info="Class label name used for output polygons and evaluation target.")
+            fp_label = gr.Textbox(value="fp", label="FP Label", info="Label name treated as false-positive/background supervision.")
         with gr.Row():
-            tile_size = gr.Number(value=256, precision=0, label="Tile Size")
-            tile_stride = gr.Number(value=128, precision=0, label="Tile Stride")
-            tile_scales = gr.Textbox(value="1.0", label="Tile Scales")
+            tile_size = gr.Number(value=256, precision=0, label="Tile Size", info="Side length of each square inference/training tile in pixels.")
+            tile_stride = gr.Number(value=128, precision=0, label="Tile Stride", info="Step size between tile origins; lower values add overlap and compute cost.")
+            tile_scales = gr.Textbox(value="1.0", label="Tile Scales", info="Comma-separated tile scale multipliers for multi-scale training crops.")
             gr.Number(value=4, precision=0, label="Seg Out Stride (fixed in script)", interactive=False)
         with gr.Row():
-            batch_size = gr.Number(value=8, precision=0, label="Batch Size")
-            num_workers = gr.Number(value=8, precision=0, label="Num Workers")
-            lr = gr.Number(value=1e-4, label="LR")
-            lr_min = gr.Number(value=1e-5, label="LR Min")
-            lr_scheduler = gr.Dropdown(choices=["none", "cosine"], value="cosine", label="LR Scheduler")
+            batch_size = gr.Number(value=8, precision=0, label="Batch Size", info="Mini-batch size used during training.")
+            num_workers = gr.Number(value=8, precision=0, label="Num Workers", info="Number of data-loader workers for parallel sample preparation.")
+            lr = gr.Number(value=1e-4, label="LR", info="Initial optimizer learning rate.")
+            lr_min = gr.Number(value=1e-5, label="LR Min", info="Minimum learning rate floor (used by cosine schedule).")
+            lr_scheduler = gr.Dropdown(choices=["none", "cosine"], value="cosine", label="LR Scheduler", info="Learning-rate scheduling strategy used during training.")
         with gr.Row():
-            dino_upsampler = gr.Dropdown(choices=["learned", "pixelshuffle", "anyup"], value="learned", label="DINO Upsampler")
-            dino_layers = gr.Textbox(value="last", label="DINO Layers (last or 1-based csv)")
-            anyup_q_chunk_size = gr.Number(value=256, precision=0, label="AnyUp q_chunk_size")
-            head_type = gr.Dropdown(choices=["pointwise", "dwsep", "residual"], value="pointwise", label="Head Type")
-            weight_decay = gr.Number(value=1e-4, label="Weight Decay")
+            dino_upsampler = gr.Dropdown(choices=["learned", "pixelshuffle", "anyup"], value="learned", label="DINO Upsampler", info="Upsampling head used to project DINO tokens to dense feature maps.")
+            dino_layers = gr.Textbox(value="last", label="DINO Layers (last or 1-based csv)", info="DINO transformer layers to use (\"last\" or comma-separated 1-based indices).")
+            anyup_q_chunk_size = gr.Number(value=256, precision=0, label="AnyUp q_chunk_size", info="Chunk size used by AnyUp attention upsampler to limit memory.")
+            local_backbone = gr.Dropdown(choices=["resnet18", "resnet34", "resnet50"], value="resnet18", label="Local ResNet Backbone", info="Select local CNN backbone used before fusion. ResNet50 has higher capacity and more channels.")
+            local_unfreeze = gr.Dropdown(choices=["none", "l1", "stem+1"], value="none", label="Local ResNet Unfreeze", info="Unfreeze local ResNet blocks: none (frozen), l1 (layer1 only), stem+1 (stem and layer1).")
+            head_type = gr.Dropdown(choices=["pointwise", "dwsep", "residual"], value="pointwise", label="Head Type", info="Segmentation decoder head architecture variant.")
+            weight_decay = gr.Number(value=1e-4, label="Weight Decay", info="L2-style regularization strength in the optimizer.")
         with gr.Row():
-            use_tile_cls_head = gr.Dropdown(choices=["on", "off"], value="on", label="Use Tile Cls Head")
-            balance_train_50_50 = gr.Dropdown(choices=["on", "off"], value="on", label="Balance Train 50/50")
-            balance_val_50_50 = gr.Dropdown(choices=["on", "off"], value="on", label="Balance Val 50/50")
-            augment_low_vis = gr.Dropdown(choices=["on", "off"], value="off", label="Low-Vis Augment")
-            hard_negative_mining = gr.Dropdown(choices=["on", "off"], value="on", label="Hard Negative Mining")
-            trust_torch_hub_repo = gr.Dropdown(choices=["on", "off"], value="on", label="Trust torch.hub repo")
+            use_tile_cls_head = gr.Dropdown(choices=["on", "off"], value="on", label="Use Tile Cls Head", info="Enable auxiliary tile-level classification head during training.")
+            balance_train_50_50 = gr.Dropdown(choices=["on", "off"], value="on", label="Balance Train 50/50", info="Balance train sampling between positive and negative tiles.")
+            balance_val_50_50 = gr.Dropdown(choices=["on", "off"], value="on", label="Balance Val 50/50", info="Balance validation sampling between positive and negative tiles.")
+            augment_low_vis = gr.Dropdown(choices=["on", "off"], value="off", label="Low-Vis Augment", info="Enable low-visibility image augmentations during training.")
+            hard_negative_mining = gr.Dropdown(choices=["on", "off"], value="on", label="Hard Negative Mining", info="Enable hard-negative mining to focus on difficult negatives.")
+            trust_torch_hub_repo = gr.Dropdown(choices=["on", "off"], value="on", label="Trust torch.hub repo", info="Allow torch.hub to trust and execute repository code without prompt.")
         with gr.Row():
-            tile_cls_weight = gr.Number(value=0.3, label="Tile Cls Weight")
-            hnm_hard_ratio = gr.Number(value=0.3, label="HNM Hard Ratio")
-            hnm_pool_frac = gr.Number(value=0.2, label="HNM Pool Frac")
-            val_interval = gr.Number(value=5, precision=0, label="Val Interval")
-            image_log_interval = gr.Number(value=1, precision=0, label="Image Log Interval")
+            tile_cls_weight = gr.Number(value=0.3, label="Tile Cls Weight", info="Loss weight for auxiliary tile classification objective.")
+            hnm_hard_ratio = gr.Number(value=0.3, label="HNM Hard Ratio", info="Fraction of hard negatives mixed into each mined negative batch.")
+            hnm_pool_frac = gr.Number(value=0.2, label="HNM Pool Frac", info="Fraction of negative pool considered when selecting hard examples.")
+            val_interval = gr.Number(value=5, precision=0, label="Val Interval", info="Run validation every N training epochs.")
+            image_log_interval = gr.Number(value=1, precision=0, label="Image Log Interval", info="Log visual prediction examples every N epochs.")
         with gr.Row():
-            mcc_weight = gr.Number(value=0.4, label="MCC Weight")
-            mcc_warmup_epochs = gr.Number(value=3, precision=0, label="MCC Warmup Epochs")
-            bce_weight = gr.Number(value=0.5, label="BCE Weight")
-            boundary_weight = gr.Number(value=0.2, label="Boundary Weight")
+            mcc_weight = gr.Number(value=0.4, label="MCC Weight", info="Loss weight for Matthews correlation coefficient term.")
+            mcc_warmup_epochs = gr.Number(value=3, precision=0, label="MCC Warmup Epochs", info="Epochs used to ramp in MCC loss contribution.")
+            bce_weight = gr.Number(value=0.5, label="BCE Weight", info="Loss weight for binary cross-entropy segmentation term.")
+            boundary_weight = gr.Number(value=0.2, label="Boundary Weight", info="Loss weight for boundary-focused segmentation term.")
             training_strategy = gr.Dropdown(
                 choices=["task_only", "semantic_preserve"],
                 value="task_only",
                 label="Training Strategy",
+                info="Select pure task loss or semantic-preservation regularized training.",
             )
-            use_fp_supervision = gr.Dropdown(choices=["on", "off"], value="on", label="Use FP Supervision")
-            fp_neg_weight = gr.Number(value=0.3, label="FP Neg Weight")
-            fp_neg_ratio = gr.Number(value=0.5, label="FP Neg Ratio (balanced neg)")
+            use_fp_supervision = gr.Dropdown(choices=["on", "off"], value="on", label="Use FP Supervision", info="If on, include fp-labeled objects in negative supervision terms.")
+            fp_neg_weight = gr.Number(value=0.3, label="FP Neg Weight", info="Loss weight applied to false-positive negative supervision.")
+            fp_neg_ratio = gr.Number(value=0.5, label="FP Neg Ratio (balanced neg)", info="Target ratio of fp negatives among sampled negatives.")
         with gr.Group(visible=False) as semantic_preserve_controls:
             gr.Markdown(
                 "Semantic-preserve weights: `Preserve Weight` scales feature-preservation loss; "
@@ -228,12 +237,12 @@ def build_tab(root: Path) -> None:
                 "`Var Gamma` is the target per-channel token std threshold for that regularizer."
             )
             with gr.Row():
-                preserve_weight = gr.Number(value=0.10, label="Preserve Weight")
-                preserve_warmup_epochs = gr.Number(value=3, precision=0, label="Preserve Warmup")
-                preserve_bg_weight = gr.Number(value=1.0, label="Preserve BG Weight")
-                preserve_fg_weight = gr.Number(value=0.25, label="Preserve FG Weight")
-                var_weight = gr.Number(value=0.01, label="Var Weight")
-                var_gamma = gr.Number(value=0.5, label="Var Gamma")
+                preserve_weight = gr.Number(value=0.10, label="Preserve Weight", info="Global weight for semantic feature preservation loss.")
+                preserve_warmup_epochs = gr.Number(value=3, precision=0, label="Preserve Warmup", info="Epochs used to warm up semantic preservation loss weight.")
+                preserve_bg_weight = gr.Number(value=1.0, label="Preserve BG Weight", info="Relative preservation weight for background tokens.")
+                preserve_fg_weight = gr.Number(value=0.25, label="Preserve FG Weight", info="Relative preservation weight for foreground/object tokens.")
+                var_weight = gr.Number(value=0.01, label="Var Weight", info="Weight of variance regularizer used to avoid feature collapse.")
+                var_gamma = gr.Number(value=0.5, label="Var Gamma", info="Target token standard-deviation threshold for variance regularization.")
 
         training_strategy.change(
             fn=_toggle_semantic_controls,
@@ -263,6 +272,8 @@ def build_tab(root: Path) -> None:
                 dino_upsampler,
                 dino_layers,
                 anyup_q_chunk_size,
+                local_backbone,
+                local_unfreeze,
                 head_type,
                 use_tile_cls_head,
                 tile_cls_weight,

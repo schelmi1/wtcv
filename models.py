@@ -12,7 +12,7 @@ from backbones_adapters import (
     DinoLearnedUpsampler,
     DinoPixelShuffleUpsampler,
     FrozenDinoTokenBranch,
-    ResNet18LocalBranch,
+    ResNetLocalBranch,
 )
 from heads import (
     AnyUpDwSepSegHead,
@@ -180,6 +180,7 @@ class Stage1SegNet(nn.Module):
         trust_repo: bool = True,
         dino_upsampler_type: str = "learned",
         anyup_q_chunk_size: int = 256,
+        local_backbone: str = "resnet18",
         head_type: str = "pointwise",
         dino_layers: Union[str, Sequence[int], None] = "last",
         use_tile_cls_head: bool = False,
@@ -188,9 +189,12 @@ class Stage1SegNet(nn.Module):
         super().__init__()
         if dino_upsampler_type not in {"learned", "pixelshuffle", "anyup"}:
             raise ValueError(f"Unsupported dino_upsampler_type={dino_upsampler_type}")
+        if str(local_backbone).strip().lower() not in {"resnet18", "resnet34", "resnet50"}:
+            raise ValueError(f"Unsupported local_backbone={local_backbone}")
         if head_type not in {"pointwise", "dwsep", "residual"}:
             raise ValueError(f"Unsupported head_type={head_type}")
         self.dino_upsampler_type = dino_upsampler_type
+        self.local_backbone = str(local_backbone).strip().lower()
         self.head_type = head_type
         self.dino_layers = dino_layers
         self.use_tile_cls_head = bool(use_tile_cls_head)
@@ -229,8 +233,8 @@ class Stage1SegNet(nn.Module):
             self.tile_cls_head = TileClassifierHead(channels) if self.use_tile_cls_head else None
             self.zoom_cls_head = ZoomRoiClassifierHead(channels) if self.use_zoom_cls_head else None
         else:
-            self.local = ResNet18LocalBranch(channels)
-            self.fuse_1x1 = nn.Conv2d(channels + 64, channels, kernel_size=1)
+            self.local = ResNetLocalBranch(backbone=self.local_backbone, out_channels=channels)
+            self.fuse_1x1 = nn.Conv2d(channels + int(self.local.out_channels), channels, kernel_size=1)
             self.head = SegmentationHead(channels)
             self.anyup_head = None
             self.tile_cls_head = TileClassifierHead(channels) if self.use_tile_cls_head else None

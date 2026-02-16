@@ -128,6 +128,7 @@ def _load_stage1_adapter(checkpoint_path: str) -> Stage1Adapter:
         trust_repo=bool(_cfg_get(cfg, "trust_torch_hub_repo", True)),
         dino_upsampler_type=str(_cfg_get(cfg, "dino_upsampler_type", "learned")),
         anyup_q_chunk_size=int(_cfg_get(cfg, "anyup_q_chunk_size", 256)),
+        local_backbone=str(_cfg_get(cfg, "local_backbone", "resnet18")),
         head_type=str(_cfg_get(cfg, "head_type", "pointwise")),
         dino_layers=_cfg_get(cfg, "dino_layers", "last"),
         use_tile_cls_head=bool(_cfg_get(cfg, "use_tile_cls_head", False)),

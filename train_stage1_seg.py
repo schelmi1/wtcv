@@ -28,8 +28,9 @@ import matplotlib.pyplot as plt
 
 from tqdm.auto import tqdm
 
-from losses import mcc_bce_boundary_loss, segmentation_metrics
+from losses import compose_training_loss, get_epoch_mcc_weight, segmentation_metrics
 from models import Stage1SegNet, load_stage1_state_dict_compat
+from wtcv_utils.labelme import polygon_area
 from wtcv_utils.records import discover_labels, load_labelme_records
 from wtcv_utils.tiling import crop_with_pad, tile_origins
 
@@ -63,6 +64,8 @@ class Cfg:
     dino_upsampler_type: str = "learned"  # learned | pixelshuffle | anyup
     dino_layers: str = "last"  # "last" or comma-separated 1-based layers, e.g. "6,9,12"
     anyup_q_chunk_size: int = 256
+    local_backbone: str = "resnet18"  # resnet18 | resnet34 | resnet50
+    local_unfreeze: str = "none"  # none | l1 | stem+1
     head_type: str = "pointwise"  # pointwise | dwsep | residual
     use_tile_cls_head: bool = True
     tile_cls_weight: float = 0.3
@@ -130,27 +133,116 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def summarize_module_params(model: nn.Module) -> List[Tuple[str, int, int]]:
+    rows: List[Tuple[str, int, int]] = []
+    for name, module in model.named_children():
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        rows.append((name, int(trainable), int(total)))
+    return rows
+
+
+def print_section(title: str) -> None:
+    bar = "=" * 18
+    print(f"\n{bar} {title} {bar}")
+
+
+def print_kv_rows(rows: List[Tuple[str, object]], indent: str = "  ") -> None:
+    if len(rows) == 0:
+        return
+    key_w = max(len(str(k)) for k, _ in rows)
+    for k, v in rows:
+        print(f"{indent}{str(k):<{key_w}} : {v}")
+
+
+def _clip_polygon_to_rect(
+    points: List[List[float]],
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+) -> List[List[float]]:
+    # Sutherland-Hodgman polygon clipping against axis-aligned rectangle.
+    poly = [[float(p[0]), float(p[1])] for p in points]
+
+    def _clip_edge(
+        inp: List[List[float]],
+        inside,
+        intersect,
+    ) -> List[List[float]]:
+        if len(inp) == 0:
+            return []
+        out: List[List[float]] = []
+        s = inp[-1]
+        for e in inp:
+            s_in = inside(s)
+            e_in = inside(e)
+            if e_in:
+                if not s_in:
+                    out.append(intersect(s, e))
+                out.append([float(e[0]), float(e[1])])
+            elif s_in:
+                out.append(intersect(s, e))
+            s = e
+        return out
+
+    def _intersect_with_x(s: List[float], e: List[float], xc: float) -> List[float]:
+        dx = float(e[0] - s[0])
+        if abs(dx) < 1e-12:
+            return [float(xc), float(s[1])]
+        t = float((xc - s[0]) / dx)
+        y = float(s[1] + t * (e[1] - s[1]))
+        return [float(xc), y]
+
+    def _intersect_with_y(s: List[float], e: List[float], yc: float) -> List[float]:
+        dy = float(e[1] - s[1])
+        if abs(dy) < 1e-12:
+            return [float(s[0]), float(yc)]
+        t = float((yc - s[1]) / dy)
+        x = float(s[0] + t * (e[0] - s[0]))
+        return [x, float(yc)]
+
+    poly = _clip_edge(poly, inside=lambda p: p[0] >= x0, intersect=lambda s, e: _intersect_with_x(s, e, x0))
+    poly = _clip_edge(poly, inside=lambda p: p[0] <= x1, intersect=lambda s, e: _intersect_with_x(s, e, x1))
+    poly = _clip_edge(poly, inside=lambda p: p[1] >= y0, intersect=lambda s, e: _intersect_with_y(s, e, y0))
+    poly = _clip_edge(poly, inside=lambda p: p[1] <= y1, intersect=lambda s, e: _intersect_with_y(s, e, y1))
+    return poly
+
+
 def objects_in_tile(objs: List[Dict], x0: int, y0: int, size: int) -> List[Dict]:
     x1, y1 = x0 + size, y0 + size
     out = []
     for o in objs:
         bx0, by0, bx1, by1 = o["bbox_xyxy"]
-        # Keep only objects whose bbox is fully contained in the tile.
-        fully_within = (bx0 >= x0) and (by0 >= y0) and (bx1 <= x1) and (by1 <= y1)
-        if not fully_within:
+        # Keep objects that intersect tile bounds, including truncated masks at borders.
+        ibx0 = float(max(float(x0), float(bx0)))
+        iby0 = float(max(float(y0), float(by0)))
+        ibx1 = float(min(float(x1), float(bx1)))
+        iby1 = float(min(float(y1), float(by1)))
+        if ibx1 <= ibx0 or iby1 <= iby0:
             continue
+
         # Keep shifted geometry in tile-local coordinates.
-        sbx0 = float(max(0.0, min(size, bx0 - x0)))
-        sby0 = float(max(0.0, min(size, by0 - y0)))
-        sbx1 = float(max(0.0, min(size, bx1 - x0)))
-        sby1 = float(max(0.0, min(size, by1 - y0)))
+        sbx0 = float(max(0.0, min(size, ibx0 - x0)))
+        sby0 = float(max(0.0, min(size, iby0 - y0)))
+        sbx1 = float(max(0.0, min(size, ibx1 - x0)))
+        sby1 = float(max(0.0, min(size, iby1 - y0)))
         if sbx1 <= sbx0 or sby1 <= sby0:
             continue
-        spts = []
-        for p in o.get("points", []):
-            px = float(max(0.0, min(size, float(p[0]) - x0)))
-            py = float(max(0.0, min(size, float(p[1]) - y0)))
-            spts.append([px, py])
+
+        spts: List[List[float]] = []
+        pts = o.get("points", []) or []
+        if len(pts) >= 3:
+            clipped = _clip_polygon_to_rect(pts, float(x0), float(y0), float(x1), float(y1))
+            for p in clipped:
+                px = float(max(0.0, min(size, float(p[0]) - x0)))
+                py = float(max(0.0, min(size, float(p[1]) - y0)))
+                spts.append([px, py])
+
+        clipped_poly_area = float(o.get("poly_area", 0.0))
+        if len(spts) >= 3:
+            clipped_poly_area = float(max(0.0, polygon_area(spts)))
+
         out.append(
             {
                 "label_cf": str(o.get("label_cf", "")),
@@ -158,7 +250,7 @@ def objects_in_tile(objs: List[Dict], x0: int, y0: int, size: int) -> List[Dict]
                 "bbox_xyxy": [sbx0, sby0, sbx1, sby1],
                 "points": spts,
                 "shape_type": o.get("shape_type", "polygon"),
-                "poly_area": o["poly_area"],
+                "poly_area": clipped_poly_area,
             }
         )
     return out
@@ -600,34 +692,6 @@ def make_sample_figure(
     return fig
 
 
-def semantic_preserve_losses(
-    feat_dino: torch.Tensor,
-    feat_adapted: torch.Tensor,
-    seg_target: torch.Tensor,
-    bg_weight: float,
-    fg_weight: float,
-    var_gamma: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    target_hw = (int(seg_target.shape[-2]), int(seg_target.shape[-1]))
-    d = F.interpolate(feat_dino.detach(), size=target_hw, mode="bilinear", align_corners=False)
-    a = F.interpolate(feat_adapted, size=target_hw, mode="bilinear", align_corners=False)
-
-    d_n = F.normalize(d, dim=1, eps=1e-6)
-    a_n = F.normalize(a, dim=1, eps=1e-6)
-    cos = (a_n * d_n).sum(dim=1)
-    tok_loss = 1.0 - cos
-
-    fg = (seg_target[:, 0] > 0.5).float()
-    w = float(bg_weight) * (1.0 - fg) + float(fg_weight) * fg
-    preserve = (w * tok_loss).sum() / torch.clamp(w.sum(), min=1.0)
-
-    # Small anti-collapse variance term on adapted normalized features.
-    a_flat = a_n.flatten(2)
-    std = a_flat.std(dim=2, unbiased=False)
-    var = torch.relu(float(var_gamma) - std).mean()
-    return preserve, var
-
-
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -697,59 +761,26 @@ def run_epoch(
         with torch.set_grad_enabled(train):
             use_semantic_preserve = str(training_strategy).lower() == "semantic_preserve"
             pred = model(x, zoom_boxes=zoom_box, return_features=use_semantic_preserve)
-            loss, parts = mcc_bce_boundary_loss(
-                pred["seg_logit"],
-                seg_t,
+            loss, parts = compose_training_loss(
+                pred=pred,
+                seg_target=seg_t,
+                tile_target=tile_t,
+                zoom_target=zoom_t,
+                fp_target=fp_t,
                 mcc_weight=mcc_weight,
                 bce_weight=bce_weight,
                 boundary_weight=boundary_weight,
+                tile_cls_weight=tile_cls_weight,
+                zoom_cls_weight=zoom_cls_weight,
+                use_fp_supervision=use_fp_supervision,
+                fp_neg_weight=fp_neg_weight,
+                training_strategy=training_strategy,
+                preserve_weight=preserve_weight,
+                preserve_bg_weight=preserve_bg_weight,
+                preserve_fg_weight=preserve_fg_weight,
+                var_weight=var_weight,
+                var_gamma=var_gamma,
             )
-            tile_cls_val = float("nan")
-            if ("tile_logit" in pred) and (tile_cls_weight > 0):
-                tile_bce = F.binary_cross_entropy_with_logits(pred["tile_logit"], tile_t)
-                loss = loss + tile_cls_weight * tile_bce
-                tile_cls_val = float(tile_bce.detach().item())
-            parts["tile_cls"] = tile_cls_val
-            zoom_cls_val = float("nan")
-            if ("zoom_logit" in pred) and (zoom_cls_weight > 0) and (zoom_t is not None):
-                zoom_bce = F.binary_cross_entropy_with_logits(pred["zoom_logit"], zoom_t)
-                loss = loss + zoom_cls_weight * zoom_bce
-                zoom_cls_val = float(zoom_bce.detach().item())
-            parts["zoom_cls"] = zoom_cls_val
-            fp_sup_val = float("nan")
-            if use_fp_supervision and (fp_neg_weight > 0) and (fp_t is not None):
-                fp_mask = fp_t > 0.5
-                if bool(fp_mask.any().item()):
-                    fp_bce = F.binary_cross_entropy_with_logits(
-                        pred["seg_logit"][fp_mask],
-                        torch.zeros_like(pred["seg_logit"][fp_mask]),
-                    )
-                    loss = loss + fp_neg_weight * fp_bce
-                    fp_sup_val = float(fp_bce.detach().item())
-            parts["fp_sup"] = fp_sup_val
-            preserve_val = float("nan")
-            var_val = float("nan")
-            if use_semantic_preserve:
-                feat_dino = pred.get("feat_dino", None)
-                feat_adapted = pred.get("feat_adapted", None)
-                if feat_dino is not None and feat_adapted is not None:
-                    l_preserve, l_var = semantic_preserve_losses(
-                        feat_dino=feat_dino,
-                        feat_adapted=feat_adapted,
-                        seg_target=seg_t,
-                        bg_weight=preserve_bg_weight,
-                        fg_weight=preserve_fg_weight,
-                        var_gamma=var_gamma,
-                    )
-                    if preserve_weight > 0:
-                        loss = loss + float(preserve_weight) * l_preserve
-                    if var_weight > 0:
-                        loss = loss + float(var_weight) * l_var
-                    preserve_val = float(l_preserve.detach().item())
-                    var_val = float(l_var.detach().item())
-            parts["preserve"] = preserve_val
-            parts["var"] = var_val
-            parts["total"] = float(loss.detach().item())
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -907,16 +938,6 @@ def parse_tile_configs(tile_size: int, tile_stride: int, tile_scales: str) -> Li
     return out
 
 
-def get_epoch_mcc_weight(target_weight: float, warmup_epochs: int, epoch: int) -> float:
-    if warmup_epochs <= 0:
-        return float(target_weight)
-    if epoch <= 0:
-        return 0.0
-    if epoch >= warmup_epochs:
-        return float(target_weight)
-    return float(target_weight) * (float(epoch) / float(warmup_epochs))
-
-
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Cfg):
     if cfg.lr_scheduler == "none":
         return None
@@ -937,6 +958,38 @@ def normalize_training_strategy(value: str) -> str:
     if s not in {"task_only", "semantic_preserve"}:
         raise ValueError(f"Unsupported training_strategy: {value}")
     return s
+
+
+def normalize_local_unfreeze_mode(value: str) -> str:
+    s = str(value).strip().lower().replace(" ", "")
+    if s in {"", "none", "off", "0", "frozen"}:
+        return "none"
+    if s in {"l1", "1", "layer1"}:
+        return "l1"
+    if s in {"stem+1", "stem+l1", "stem+layer1", "stem1", "stem+l"}:
+        return "stem+1"
+    raise ValueError(f"Unsupported local_unfreeze mode: {value}. Use one of: none, l1, stem+1")
+
+
+def apply_local_resnet_unfreeze(local_module: nn.Module, mode: str) -> List[str]:
+    mode = normalize_local_unfreeze_mode(mode)
+    if mode == "none":
+        return []
+
+    unfrozen: List[str] = []
+    if mode == "l1":
+        for p in local_module.l1.parameters():
+            p.requires_grad = True
+        unfrozen.append("local.l1")
+        return unfrozen
+
+    # stem+1
+    for p in local_module.stem.parameters():
+        p.requires_grad = True
+    for p in local_module.l1.parameters():
+        p.requires_grad = True
+    unfrozen.extend(["local.stem", "local.l1"])
+    return unfrozen
 
 
 def parse_args() -> Cfg:
@@ -973,6 +1026,13 @@ def parse_args() -> Cfg:
     ap.add_argument("--dino-upsampler-type", dest="dino_upsampler_type", type=str, choices=["learned", "pixelshuffle", "anyup"], help=argparse.SUPPRESS)
     ap.add_argument("--dino-layers", type=str, default="last", help="DINO layers: 'last' or comma-separated 1-based ids (e.g. 6,9,12)")
     ap.add_argument("--anyup-q-chunk-size", type=int, default=256)
+    ap.add_argument("--local-backbone", type=str, choices=["resnet18", "resnet34", "resnet50"], default="resnet18")
+    ap.add_argument(
+        "--local-unfreeze",
+        type=str,
+        default="none",
+        help="Unfreeze mode for local ResNet branch: none | l1 | stem+1",
+    )
     ap.add_argument("--head-type", type=str, choices=["pointwise", "dwsep", "residual"], default="pointwise")
     ap.add_argument("--use-tile-cls-head", action="store_true", default=True)
     ap.add_argument("--no-use-tile-cls-head", action="store_false", dest="use_tile_cls_head")
@@ -1022,6 +1082,7 @@ def parse_args() -> Cfg:
     a = ap.parse_args()
 
     training_strategy = normalize_training_strategy(a.training_strategy)
+    local_unfreeze = normalize_local_unfreeze_mode(a.local_unfreeze)
 
     return Cfg(
         data_dir=a.data_dir,
@@ -1047,6 +1108,8 @@ def parse_args() -> Cfg:
         dino_upsampler_type=a.dino_upsampler_type,
         dino_layers=a.dino_layers,
         anyup_q_chunk_size=a.anyup_q_chunk_size,
+        local_backbone=a.local_backbone,
+        local_unfreeze=local_unfreeze,
         head_type=a.head_type,
         use_tile_cls_head=a.use_tile_cls_head,
         tile_cls_weight=a.tile_cls_weight,
@@ -1135,60 +1198,108 @@ def main() -> None:
     order = np.arange(len(records))
     rng.shuffle(order)
     records = [records[i] for i in order]
-    print(f"Loaded records={len(records)}")
-    print("Effective flags:")
-    print(f"  resume_checkpoint={str(cfg.resume_checkpoint) if cfg.resume_checkpoint else 'None'}")
-    if cfg.resume_checkpoint is not None:
-        print("  note: --epochs is interpreted as additional epochs when resuming")
-        print("  note: resume always writes to a new run directory")
-        print("  note: resume resets LR/scheduler to cfg.lr/cfg.lr_min for the new run")
-    print(f"  balance_train_50_50={cfg.balance_train_50_50}")
-    print(f"  balance_val_50_50={cfg.balance_val_50_50}")
-    print(f"  subset_size={cfg.subset_size} (applied after balancing/shuffle)")
-    print(f"  tile_size={cfg.tile_size}, tile_stride={cfg.tile_stride}")
-    print(f"  tile_scales={cfg.tile_scales}")
-    print(f"  seg_out_stride={cfg.seg_out_stride}")
-    print(f"  batch_size={cfg.batch_size}, num_workers={cfg.num_workers}")
-    print(f"  dataloader_verbose={cfg.dataloader_verbose}")
-    print(f"  dino_upsampler_type={cfg.dino_upsampler_type}")
-    print(f"  dino_layers={cfg.dino_layers}")
-    if cfg.dino_upsampler_type == "anyup":
-        print(f"  anyup_q_chunk_size={cfg.anyup_q_chunk_size}")
-        print(f"  head_type={cfg.head_type}")
-    print(f"  use_tile_cls_head={cfg.use_tile_cls_head} tile_cls_weight={cfg.tile_cls_weight}")
-    print(f"  use_zoom_cls_head={cfg.use_zoom_cls_head} zoom_cls_weight={cfg.zoom_cls_weight}")
-    print(
-        f"  use_fp_supervision={cfg.use_fp_supervision} fp_label='{cfg.fp_label}' "
-        f"fp_neg_weight={cfg.fp_neg_weight} fp_neg_ratio={cfg.fp_neg_ratio}"
+    print_section("Run Setup")
+    print_kv_rows(
+        [
+            ("run_dir", run_dir),
+            ("checkpoints_dir", ckpt_dir),
+            ("records_loaded", len(records)),
+            ("resume_checkpoint", str(cfg.resume_checkpoint) if cfg.resume_checkpoint else "None"),
+            ("seed", cfg.seed),
+        ]
     )
-    print(f"  val_interval={cfg.val_interval}, image_log_interval={cfg.image_log_interval}")
-    print(f"  iou_threshold={cfg.iou_threshold}")
-    print(f"  training_strategy={cfg.training_strategy}")
+    if cfg.resume_checkpoint is not None:
+        print("  resume_notes:")
+        print("    - --epochs is interpreted as additional epochs when resuming")
+        print("    - resume always writes to a new run directory")
+        print("    - resume resets LR/scheduler to cfg.lr/cfg.lr_min for the new run")
+
+    print_section("Data + Tiling")
+    print_kv_rows(
+        [
+            ("data_dir", cfg.data_dir),
+            ("label_name", cfg.label_name),
+            ("fp_label", cfg.fp_label),
+            ("balance_train_50_50", cfg.balance_train_50_50),
+            ("balance_val_50_50", cfg.balance_val_50_50),
+            ("subset_size", f"{cfg.subset_size} (applied after balancing/shuffle)"),
+            ("tile_size", cfg.tile_size),
+            ("tile_stride", cfg.tile_stride),
+            ("tile_scales", cfg.tile_scales),
+            ("seg_out_stride", cfg.seg_out_stride),
+            ("batch_size", cfg.batch_size),
+            ("num_workers", cfg.num_workers),
+            ("dataloader_verbose", cfg.dataloader_verbose),
+        ]
+    )
+
+    print_section("Model + Heads")
+    rows_model: List[Tuple[str, object]] = [
+        ("dino_upsampler_type", cfg.dino_upsampler_type),
+        ("dino_layers", cfg.dino_layers),
+        ("local_backbone", cfg.local_backbone),
+        ("local_unfreeze", cfg.local_unfreeze),
+        ("use_tile_cls_head", f"{cfg.use_tile_cls_head} (weight={cfg.tile_cls_weight})"),
+        ("use_zoom_cls_head", f"{cfg.use_zoom_cls_head} (weight={cfg.zoom_cls_weight})"),
+        (
+            "use_fp_supervision",
+            f"{cfg.use_fp_supervision} (fp_neg_weight={cfg.fp_neg_weight}, fp_neg_ratio={cfg.fp_neg_ratio})",
+        ),
+        ("trust_torch_hub_repo", cfg.trust_torch_hub_repo),
+    ]
+    if cfg.dino_upsampler_type == "anyup":
+        rows_model.append(("anyup_q_chunk_size", cfg.anyup_q_chunk_size))
+        rows_model.append(("head_type", cfg.head_type))
+    print_kv_rows(rows_model)
+
+    print_section("Loss + Optimizer")
+    print_kv_rows(
+        [
+            ("training_strategy", cfg.training_strategy),
+            ("mcc_weight", cfg.mcc_weight),
+            ("mcc_warmup_epochs", cfg.mcc_warmup_epochs),
+            ("bce_weight", cfg.bce_weight),
+            ("boundary_weight", cfg.boundary_weight),
+            ("lr", cfg.lr),
+            ("lr_scheduler", cfg.lr_scheduler),
+            ("lr_min", cfg.lr_min),
+            ("weight_decay", cfg.weight_decay),
+            ("val_interval", cfg.val_interval),
+            ("image_log_interval", cfg.image_log_interval),
+            ("iou_threshold", cfg.iou_threshold),
+            ("augment_low_vis", cfg.augment_low_vis),
+            (
+                "hard_negative_mining",
+                f"{cfg.hard_negative_mining} (hard_ratio={cfg.hnm_hard_ratio}, pool_frac={cfg.hnm_pool_frac})",
+            ),
+        ]
+    )
     print(
-        f"  loss={cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + "
-        f"{cfg.boundary_weight}*boundary + {cfg.tile_cls_weight}*tile_cls + "
-        f"{cfg.zoom_cls_weight}*zoom_cls + {cfg.fp_neg_weight}*fp_sup(if enabled)"
+        "  loss_formula        : "
+        f"{cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + {cfg.boundary_weight}*boundary + "
+        f"{cfg.tile_cls_weight}*tile_cls + {cfg.zoom_cls_weight}*zoom_cls + {cfg.fp_neg_weight}*fp_sup(if enabled)"
     )
     if cfg.training_strategy == "semantic_preserve":
         print(
-            f"  semantic_preserve={cfg.preserve_weight}*preserve + {cfg.var_weight}*var "
+            "  semantic_preserve   : "
+            f"{cfg.preserve_weight}*preserve + {cfg.var_weight}*var "
             f"(warmup={cfg.preserve_warmup_epochs}, bg_w={cfg.preserve_bg_weight}, "
             f"fg_w={cfg.preserve_fg_weight}, var_gamma={cfg.var_gamma})"
         )
-    print(f"  mcc_warmup_epochs={cfg.mcc_warmup_epochs}")
-    print(f"  lr={cfg.lr} lr_scheduler={cfg.lr_scheduler} lr_min={cfg.lr_min}")
-    print(f"  augment_low_vis={cfg.augment_low_vis}")
-    print(
-        f"  hard_negative_mining={cfg.hard_negative_mining} "
-        f"(hard_ratio={cfg.hnm_hard_ratio}, pool_frac={cfg.hnm_pool_frac})"
-    )
 
     split = int(0.95 * len(records))
     train_records = records[:split]
     val_records = records[split:]
 
     tile_configs = parse_tile_configs(cfg.tile_size, cfg.tile_stride, cfg.tile_scales)
-    print(f"  tile_configs={tile_configs}")
+    print_section("Dataset Build")
+    print_kv_rows(
+        [
+            ("train_records", len(train_records)),
+            ("val_records", len(val_records)),
+            ("tile_configs", tile_configs),
+        ]
+    )
 
     train_ds = SegTileDataset(
         train_records,
@@ -1229,18 +1340,23 @@ def main() -> None:
             i for i, s in enumerate(train_ds.samples) if (s["is_object"] == 0 and s.get("has_fp", 0) == 1)
         ]
         train_ds.neg_hard_scores = np.zeros(len(train_ds.samples), dtype=np.float32)
-        print(
-            f"Applied subset_size={cfg.subset_size} after balancing. "
-            f"effective_train_tiles={len(train_ds)}"
-        )
+        subset_note = f"applied subset_size={cfg.subset_size} after balancing"
     else:
-        print(f"Using full train set after dataset balancing step. effective_train_tiles={len(train_ds)}")
+        subset_note = "using full train set after dataset balancing step"
         train_ds.neg_hard_scores = np.zeros(len(train_ds.samples), dtype=np.float32)
 
-    print(
-        f"train_tile_balance: pos={len(getattr(train_ds, 'pos_dataset_indices', []))} "
-        f"neg={len(getattr(train_ds, 'neg_dataset_indices', []))} "
-        f"fp_neg={len(getattr(train_ds, 'fp_neg_dataset_indices', []))}"
+    pos_tiles = len(getattr(train_ds, "pos_dataset_indices", []))
+    neg_tiles = len(getattr(train_ds, "neg_dataset_indices", []))
+    fp_neg_tiles = len(getattr(train_ds, "fp_neg_dataset_indices", []))
+    print_kv_rows(
+        [
+            ("subset", subset_note),
+            ("train_tiles", len(train_ds)),
+            ("val_tiles", len(val_ds)),
+            ("train_pos_tiles", pos_tiles),
+            ("train_neg_tiles", neg_tiles),
+            ("train_fp_neg_tiles", fp_neg_tiles),
+        ]
     )
     if len(getattr(train_ds, "pos_dataset_indices", [])) == 0:
         found = discover_labels(cfg.data_dir)
@@ -1254,8 +1370,8 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}")
-    print(f"train_tiles={len(train_ds)} val_tiles={len(val_ds)}")
+    print_section("Model Init + Parameters")
+    print_kv_rows([("device", device)])
 
     model = Stage1SegNet(
         channels=cfg.fusion_channels,
@@ -1263,6 +1379,7 @@ def main() -> None:
         dino_upsampler_type=cfg.dino_upsampler_type,
         dino_layers=cfg.dino_layers,
         anyup_q_chunk_size=cfg.anyup_q_chunk_size,
+        local_backbone=cfg.local_backbone,
         head_type=cfg.head_type,
         use_tile_cls_head=cfg.use_tile_cls_head,
         use_zoom_cls_head=cfg.use_zoom_cls_head,
@@ -1271,9 +1388,16 @@ def main() -> None:
     # Freeze both backbones to reduce overfitting.
     for p in model.dino.parameters():
         p.requires_grad = False
+    local_unfrozen_modules: List[str] = []
     if model.local is not None:
         for p in model.local.parameters():
             p.requires_grad = False
+        local_unfrozen_modules = apply_local_resnet_unfreeze(model.local, cfg.local_unfreeze)
+    elif cfg.local_unfreeze != "none":
+        print(
+            f"warning: local_unfreeze={cfg.local_unfreeze} requested, but local branch is disabled "
+            f"(dino_upsampler_type={cfg.dino_upsampler_type}); ignoring."
+        )
     # In anyup mode, keep the learned upsampler frozen and use AnyUp directly.
     if cfg.dino_upsampler_type == "anyup":
         for p in model.dino_up.parameters():
@@ -1291,7 +1415,38 @@ def main() -> None:
         module_msg = f"{module_msg}, tile_cls_head"
     if cfg.use_zoom_cls_head:
         module_msg = f"{module_msg}, zoom_cls_head"
-    print(f"trainable modules: {module_msg} | trainable_params={sum(p.numel() for p in trainable)}")
+    if len(local_unfrozen_modules) > 0:
+        module_msg = f"{module_msg}, {', '.join(local_unfrozen_modules)}"
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in trainable)
+    print_kv_rows(
+        [
+            ("trainable_modules", module_msg),
+            ("local_unfrozen", ", ".join(local_unfrozen_modules) if local_unfrozen_modules else "none"),
+            ("trainable_params", f"{trainable_params:,}"),
+            ("total_params", f"{total_params:,}"),
+            ("optimizer", "AdamW"),
+            ("scheduler", cfg.lr_scheduler),
+        ]
+    )
+    print("  module_parameter_breakdown:")
+    for mod_name, mod_trainable, mod_total in summarize_module_params(model):
+        mod_frozen = mod_total - mod_trainable
+        print(
+            f"    - {mod_name:14s} trainable={mod_trainable:,} "
+            f"frozen={mod_frozen:,} total={mod_total:,}"
+        )
+    root_direct = sum(p.numel() for p in model.parameters(recurse=False))
+    if root_direct > 0:
+        root_direct_trainable = sum(p.numel() for p in model.parameters(recurse=False) if p.requires_grad)
+        print(
+            f"    - {'<root-direct>':14s} trainable={root_direct_trainable:,} "
+            f"frozen={root_direct - root_direct_trainable:,} total={root_direct:,}"
+        )
+    print(
+        f"    - {'TOTAL':14s} trainable={trainable_params:,} "
+        f"frozen={total_params - trainable_params:,} total={total_params:,}"
+    )
 
     history = []
     best_val_iou = -1.0
@@ -1302,6 +1457,7 @@ def main() -> None:
     target_end_epoch = cfg.epochs
 
     if resume_blob is not None:
+        print_section("Resume State")
         state = resume_blob["model"] if isinstance(resume_blob, dict) and "model" in resume_blob else resume_blob
         load_stage1_state_dict_compat(
             model,
@@ -1352,14 +1508,28 @@ def main() -> None:
             val_global_step = int(resume_blob.get("val_global_step", 0))
 
         target_end_epoch = resume_base_epoch + cfg.epochs
-        print(
-            f"Resumed from {resume_ckpt} | start_epoch={start_epoch} "
-            f"target_end_epoch={target_end_epoch} "
-            f"best_val_iou={best_val_iou:.4f} train_global_step={train_global_step} "
-            f"val_global_step={val_global_step}"
+        print_kv_rows(
+            [
+                ("resumed_from", resume_ckpt),
+                ("resume_base_epoch", resume_base_epoch),
+                ("start_epoch", start_epoch),
+                ("target_end_epoch", target_end_epoch),
+                ("best_val_iou", f"{best_val_iou:.4f}"),
+                ("train_global_step", train_global_step),
+                ("val_global_step", val_global_step),
+            ]
         )
     else:
         target_end_epoch = cfg.epochs
+
+    print_section("Epoch Plan")
+    print_kv_rows(
+        [
+            ("start_epoch", start_epoch),
+            ("target_end_epoch", target_end_epoch),
+            ("total_epochs_this_run", max(0, target_end_epoch - start_epoch + 1)),
+        ]
+    )
 
     if start_epoch > target_end_epoch:
         print(

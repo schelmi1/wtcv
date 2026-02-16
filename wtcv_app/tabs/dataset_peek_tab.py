@@ -133,11 +133,11 @@ def dataset_peek(
 def build_tab(root: Path) -> None:
     with gr.Tab("Dataset Peek"):
         with gr.Row():
-            peek_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Dataset Dir")
-            peek_label = gr.Textbox(value="vehicle", label="Label")
-            peek_max = gr.Number(value=0, precision=0, label="Max Images for Stats (0=all)")
-            peek_sample = gr.Number(value=9, precision=0, label="Gallery Samples")
-            peek_seed = gr.Number(value=42, precision=0, label="Seed")
+            peek_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Dataset Dir", info="Dataset directory scanned for LabelMe image/json pairs.")
+            peek_label = gr.Textbox(value="vehicle", label="Label", info="Class label name used for output polygons and evaluation target.")
+            peek_max = gr.Number(value=0, precision=0, label="Max Images for Stats (0=all)", info="Optional cap of images used for dataset statistics; 0 uses all.")
+            peek_sample = gr.Number(value=9, precision=0, label="Gallery Samples", info="Number of random overlay previews to display in gallery.")
+            peek_seed = gr.Number(value=42, precision=0, label="Seed", info="Random seed for reproducible sampling and clustering behavior.")
         peek_btn = gr.Button("Analyze Dataset", variant="primary")
         peek_report = gr.Markdown()
         peek_gallery = gr.Gallery(label="Random Samples (with overlay)", columns=3, height=550)

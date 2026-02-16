@@ -130,11 +130,25 @@ class AnyUpFeatureUpsampler(nn.Module):
         return x
 
 
-class ResNet18LocalBranch(nn.Module):
-    def __init__(self, out_channels: int = 256):
+class ResNetLocalBranch(nn.Module):
+    def __init__(self, backbone: str = "resnet18", out_channels: int = 256):
         super().__init__()
         _ = out_channels  # kept for interface compatibility
-        m = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+        bb = str(backbone).strip().lower()
+        if bb == "resnet18":
+            m = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
+            l1_out = 64
+        elif bb == "resnet34":
+            m = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.DEFAULT)
+            l1_out = 64
+        elif bb == "resnet50":
+            m = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
+            l1_out = 256
+        else:
+            raise ValueError(f"Unsupported local backbone: {backbone}. Use one of: resnet18, resnet34, resnet50")
+
+        self.backbone_name = bb
+        self.out_channels = int(l1_out)
         self.stem = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)
         self.l1 = m.layer1
 
@@ -144,10 +158,17 @@ class ResNet18LocalBranch(nn.Module):
         return x
 
 
+class ResNet18LocalBranch(ResNetLocalBranch):
+    # Backward-compatible wrapper for existing imports/call-sites.
+    def __init__(self, out_channels: int = 256):
+        super().__init__(backbone="resnet18", out_channels=out_channels)
+
+
 __all__ = [
     "FrozenDinoTokenBranch",
     "DinoLearnedUpsampler",
     "DinoPixelShuffleUpsampler",
     "AnyUpFeatureUpsampler",
+    "ResNetLocalBranch",
     "ResNet18LocalBranch",
 ]

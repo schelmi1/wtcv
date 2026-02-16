@@ -6,7 +6,7 @@ from train_stage1_seg import SegTileDataset, objects_in_tile
 from wtcv_utils.records import load_labelme_records
 
 
-def test_objects_in_tile_requires_full_bbox_containment() -> None:
+def test_objects_in_tile_includes_and_clips_truncated_object() -> None:
     objs = [
         {
             "label_cf": "vehicle",
@@ -18,9 +18,14 @@ def test_objects_in_tile_requires_full_bbox_containment() -> None:
             "poly_area": 900.0,
         }
     ]
-    # Tile is 0..224 => object extends outside; should be excluded.
+    # Tile is 0..224 => object extends outside; should be included and clipped.
     got = objects_in_tile(objs, x0=0, y0=0, size=224)
-    assert got == []
+    assert len(got) == 1
+    g = got[0]
+    assert g["bbox_xyxy"] == [200.0, 200.0, 224.0, 224.0]
+    assert len(g["points"]) >= 3
+    assert all((0.0 <= float(p[0]) <= 224.0 and 0.0 <= float(p[1]) <= 224.0) for p in g["points"])
+    assert float(g["poly_area"]) > 0.0
 
 
 def test_seg_tile_dataset_balancing_and_mask_targets(seg_dataset_dir: Path) -> None:
@@ -67,4 +72,3 @@ def test_seg_tile_dataset_balancing_and_mask_targets(seg_dataset_dir: Path) -> N
     assert float(neg_item["tile_target"].item()) == 0.0
     assert float(neg_item["seg_target"].sum().item()) == 0.0
     assert float(neg_item["fp_target"].sum().item()) > 0.0
-

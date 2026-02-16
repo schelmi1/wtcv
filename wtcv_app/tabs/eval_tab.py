@@ -48,16 +48,16 @@ def run_eval(
 def build_tab(root: Path) -> None:
     with gr.Tab("Evaluate"):
         with gr.Row():
-            eval_data_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Data Dir")
-            eval_ckpt = gr.Textbox(value="", label="Checkpoint")
-            eval_label = gr.Textbox(value="vehicle", label="Label")
+            eval_data_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Data Dir", info="Directory containing training/evaluation LabelMe data pairs.")
+            eval_ckpt = gr.Textbox(value="", label="Checkpoint", info="Path to a trained model checkpoint (.pt) to load for inference/evaluation.")
+            eval_label = gr.Textbox(value="vehicle", label="Label", info="Class label name used for output polygons and evaluation target.")
         with gr.Row():
-            eval_tile_size = gr.Number(value=256, precision=0, label="Tile Size")
-            eval_tile_stride = gr.Number(value=128, precision=0, label="Tile Stride")
-            eval_seg_out_stride = gr.Number(value=4, precision=0, label="Seg Out Stride")
-            eval_pred_threshold = gr.Number(value=0.5, label="Pred Threshold")
-            eval_workers = gr.Number(value=8, precision=0, label="Num Workers")
-            eval_trust_repo = gr.Dropdown(choices=["on", "off"], value="on", label="Trust torch.hub repo")
+            eval_tile_size = gr.Number(value=256, precision=0, label="Tile Size", info="Side length of each square inference/training tile in pixels.")
+            eval_tile_stride = gr.Number(value=128, precision=0, label="Tile Stride", info="Step size between tile origins; lower values add overlap and compute cost.")
+            eval_seg_out_stride = gr.Number(value=4, precision=0, label="Seg Out Stride", info="Output stride of segmentation logits relative to tile resolution.")
+            eval_pred_threshold = gr.Number(value=0.5, label="Pred Threshold", info="Probability threshold used to convert logits/probabilities into a binary mask.")
+            eval_workers = gr.Number(value=8, precision=0, label="Num Workers", info="Number of data-loader workers for parallel sample preparation.")
+            eval_trust_repo = gr.Dropdown(choices=["on", "off"], value="on", label="Trust torch.hub repo", info="Allow torch.hub to trust and execute repository code without prompt.")
         eval_btn = gr.Button("Run Evaluation", variant="primary")
         eval_cmd = gr.Textbox(label="Command", interactive=False)
         eval_logs = gr.Textbox(label="Live Logs", lines=24, elem_classes=["mono"], interactive=False)
