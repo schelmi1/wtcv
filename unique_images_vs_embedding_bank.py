@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import json
 import math
@@ -201,8 +200,8 @@ def _copy_relinked_labelme_pair(dst_dir: Path, rank: int, image_path: Path, json
     shutil.copy2(image_path, dst_img)
     raw = json.loads(json_path.read_text(encoding="utf-8"))
     raw["imagePath"] = dst_img.name
-    with dst_img.open("rb") as f:
-        raw["imageData"] = base64.b64encode(f.read()).decode("ascii")
+    # Keep LabelMe JSON lightweight: do not inline base64 imageData.
+    raw["imageData"] = None
     try:
         with Image.open(dst_img) as im:
             w, h = im.size

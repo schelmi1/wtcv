@@ -58,6 +58,79 @@ def mcc_bce_boundary_loss(
     return total, parts
 
 
+def focal_bce_loss_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    targets = targets.float()
+    probs = torch.sigmoid(logits).clamp(min=eps, max=1.0 - eps)
+    pt = probs * targets + (1.0 - probs) * (1.0 - targets)
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    focal = -alpha_t * torch.pow(1.0 - pt, gamma) * torch.log(pt)
+    return focal.mean()
+
+
+def tversky_loss_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.7,
+    beta: float = 0.3,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    targets = targets.float()
+    probs = torch.sigmoid(logits)
+    probs_f = probs.view(probs.shape[0], -1)
+    targets_f = targets.view(targets.shape[0], -1)
+    tp = (probs_f * targets_f).sum(dim=1)
+    fp = (probs_f * (1.0 - targets_f)).sum(dim=1)
+    fn = ((1.0 - probs_f) * targets_f).sum(dim=1)
+    score = (tp + eps) / (tp + alpha * fn + beta * fp + eps)
+    return 1.0 - score.mean()
+
+
+def focal_tversky_boundary_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    focal_weight: float,
+    tversky_weight: float,
+    boundary_weight: float,
+    focal_alpha: float,
+    focal_gamma: float,
+    tversky_alpha: float,
+    tversky_beta: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    targets = targets.float()
+    focal = focal_bce_loss_with_logits(
+        logits,
+        targets,
+        alpha=focal_alpha,
+        gamma=focal_gamma,
+    )
+    tversky = tversky_loss_with_logits(
+        logits,
+        targets,
+        alpha=tversky_alpha,
+        beta=tversky_beta,
+    )
+    probs = torch.sigmoid(logits)
+    pred_b = boundary_map(probs)
+    tgt_b = boundary_map(targets)
+    bnd = F.binary_cross_entropy(pred_b, tgt_b)
+    total = focal_weight * focal + tversky_weight * tversky + boundary_weight * bnd
+    parts = {
+        "mcc": float("nan"),
+        "bce": float("nan"),
+        "focal": float(focal.detach().item()),
+        "tversky": float(tversky.detach().item()),
+        "boundary": float(bnd.detach().item()),
+        "total": float(total.detach().item()),
+    }
+    return total, parts
+
+
 def segmentation_metrics(
     pred_logit: torch.Tensor,
     seg_target: torch.Tensor,
@@ -135,8 +208,15 @@ def compose_training_loss(
     tile_target: torch.Tensor,
     zoom_target: Optional[torch.Tensor],
     fp_target: Optional[torch.Tensor],
+    segmentation_loss: str,
     mcc_weight: float,
     bce_weight: float,
+    focal_weight: float,
+    tversky_weight: float,
+    focal_alpha: float,
+    focal_gamma: float,
+    tversky_alpha: float,
+    tversky_beta: float,
     boundary_weight: float,
     tile_cls_weight: float,
     zoom_cls_weight: float,
@@ -149,13 +229,34 @@ def compose_training_loss(
     var_weight: float,
     var_gamma: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    loss, parts = mcc_bce_boundary_loss(
-        pred["seg_logit"],
-        seg_target,
-        mcc_weight=mcc_weight,
-        bce_weight=bce_weight,
-        boundary_weight=boundary_weight,
-    )
+    seg_key = str(segmentation_loss).strip().lower().replace(" ", "").replace("+", "_")
+    if seg_key in {"bce_mcc", "mcc_bce"}:
+        loss, parts = mcc_bce_boundary_loss(
+            pred["seg_logit"],
+            seg_target,
+            mcc_weight=mcc_weight,
+            bce_weight=bce_weight,
+            boundary_weight=boundary_weight,
+        )
+        parts["focal"] = float("nan")
+        parts["tversky"] = float("nan")
+    elif seg_key in {"focalbce_tversky", "focal_bce_tversky", "focaltversky"}:
+        loss, parts = focal_tversky_boundary_loss(
+            pred["seg_logit"],
+            seg_target,
+            focal_weight=focal_weight,
+            tversky_weight=tversky_weight,
+            boundary_weight=boundary_weight,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported segmentation_loss '{segmentation_loss}'. "
+            "Use one of: bce_mcc, focal_bce_tversky"
+        )
 
     tile_cls_val = float("nan")
     if ("tile_logit" in pred) and (tile_cls_weight > 0):

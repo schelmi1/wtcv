@@ -33,6 +33,8 @@ def run_train(
     head_warmup_epoch: int,
     fuser_unfreeze_epoch: int,
     dinoup_unfreeze_epoch: int,
+    head_phase_lr_scale: float,
+    fuser_phase_lr_scale: float,
     use_tile_cls_head: bool,
     use_zoom_cls_head: bool,
     tile_cls_weight: float,
@@ -46,9 +48,16 @@ def run_train(
     lr_scheduler: str,
     lr_min: float,
     weight_decay: float,
+    segmentation_loss: str,
     mcc_weight: float,
     mcc_warmup_epochs: int,
     bce_weight: float,
+    focal_weight: float,
+    tversky_weight: float,
+    focal_alpha: float,
+    focal_gamma: float,
+    tversky_alpha: float,
+    tversky_beta: float,
     boundary_weight: float,
     training_strategy: str,
     preserve_weight: float,
@@ -118,6 +127,10 @@ def run_train(
         str(int(fuser_unfreeze_epoch)),
         "--dinoup-unfreeze-epoch",
         str(int(dinoup_unfreeze_epoch)),
+        "--head-phase-lr-scale",
+        str(float(head_phase_lr_scale)),
+        "--fuser-phase-lr-scale",
+        str(float(fuser_phase_lr_scale)),
         "--tile-cls-weight",
         str(float(tile_cls_weight)),
         "--hnm-hard-ratio",
@@ -132,12 +145,26 @@ def run_train(
         str(float(lr_min)),
         "--weight-decay",
         str(float(weight_decay)),
+        "--segmentation-loss",
+        str(segmentation_loss),
         "--mcc-weight",
         str(float(mcc_weight)),
         "--mcc-warmup-epochs",
         str(int(mcc_warmup_epochs)),
         "--bce-weight",
         str(float(bce_weight)),
+        "--focal-weight",
+        str(float(focal_weight)),
+        "--tversky-weight",
+        str(float(tversky_weight)),
+        "--focal-alpha",
+        str(float(focal_alpha)),
+        "--focal-gamma",
+        str(float(focal_gamma)),
+        "--tversky-alpha",
+        str(float(tversky_alpha)),
+        "--tversky-beta",
+        str(float(tversky_beta)),
         "--boundary-weight",
         str(float(boundary_weight)),
         "--training-strategy",
@@ -186,6 +213,12 @@ def build_tab(root: Path) -> None:
         show = str(strategy).strip().lower() == "semantic_preserve"
         return gr.update(visible=show)
 
+    def _toggle_segmentation_loss_controls(seg_loss: str):
+        s = str(seg_loss).strip().lower().replace(" ", "").replace("+", "_")
+        show_mcc = s in {"bce_mcc", "mcc_bce"}
+        show_focal_tversky = s in {"focal_bce_tversky", "focalbce_tversky", "focal_tversky"}
+        return gr.update(visible=show_mcc), gr.update(visible=show_focal_tversky)
+
     with gr.Tab("Train"):
         with gr.Row():
             data_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Data Dir", info="Directory containing training/evaluation LabelMe data pairs.")
@@ -220,6 +253,8 @@ def build_tab(root: Path) -> None:
             head_warmup_epoch = gr.Number(value=1, precision=0, label="Head Warmup Epoch", info="Epoch to start training heads.")
             fuser_unfreeze_epoch = gr.Number(value=2, precision=0, label="Fuser Unfreeze Epoch", info="Epoch to unfreeze fuse_1x1.")
             dinoup_unfreeze_epoch = gr.Number(value=3, precision=0, label="DinoUp Unfreeze Epoch", info="Epoch to unfreeze dino_up (and scheduled local branch).")
+            head_phase_lr_scale = gr.Number(value=0.5, label="Head Phase LR Scale", info="LR multiplier during head-only phase.")
+            fuser_phase_lr_scale = gr.Number(value=0.75, label="Fuser Phase LR Scale", info="LR multiplier during fuser warmup phase.")
             weight_decay = gr.Number(value=1e-4, label="Weight Decay", info="L2-style regularization strength in the optimizer.")
         with gr.Row():
             use_tile_cls_head = gr.Dropdown(choices=["on", "off"], value="on", label="Use Tile Cls Head", info="Enable auxiliary tile-level classification head during training.")
@@ -236,9 +271,12 @@ def build_tab(root: Path) -> None:
             val_interval = gr.Number(value=5, precision=0, label="Val Interval", info="Run validation every N training epochs.")
             image_log_interval = gr.Number(value=1, precision=0, label="Image Log Interval", info="Log visual prediction examples every N epochs.")
         with gr.Row():
-            mcc_weight = gr.Number(value=0.4, label="MCC Weight", info="Loss weight for Matthews correlation coefficient term.")
-            mcc_warmup_epochs = gr.Number(value=3, precision=0, label="MCC Warmup Epochs", info="Epochs used to ramp in MCC loss contribution.")
-            bce_weight = gr.Number(value=0.5, label="BCE Weight", info="Loss weight for binary cross-entropy segmentation term.")
+            segmentation_loss = gr.Dropdown(
+                choices=["bce + mcc", "focal bce + tversky"],
+                value="bce + mcc",
+                label="Segmentation Loss",
+                info="Select segmentation loss family.",
+            )
             boundary_weight = gr.Number(value=0.2, label="Boundary Weight", info="Loss weight for boundary-focused segmentation term.")
             training_strategy = gr.Dropdown(
                 choices=["task_only", "semantic_preserve"],
@@ -249,6 +287,19 @@ def build_tab(root: Path) -> None:
             use_fp_supervision = gr.Dropdown(choices=["on", "off"], value="on", label="Use FP Supervision", info="If on, include fp-labeled objects in negative supervision terms.")
             fp_neg_weight = gr.Number(value=0.3, label="FP Neg Weight", info="Loss weight applied to false-positive negative supervision.")
             fp_neg_ratio = gr.Number(value=0.5, label="FP Neg Ratio (balanced neg)", info="Target ratio of fp negatives among sampled negatives.")
+        with gr.Group(visible=True) as seg_loss_mcc_controls:
+            with gr.Row():
+                mcc_weight = gr.Number(value=0.4, label="MCC Weight", info="Loss weight for Matthews correlation coefficient term.")
+                mcc_warmup_epochs = gr.Number(value=3, precision=0, label="MCC Warmup Epochs", info="Epochs used to ramp in MCC loss contribution.")
+                bce_weight = gr.Number(value=0.5, label="BCE Weight", info="Loss weight for binary cross-entropy segmentation term.")
+        with gr.Group(visible=False) as seg_loss_focal_tversky_controls:
+            with gr.Row():
+                focal_weight = gr.Number(value=1.0, label="Focal BCE Weight", info="Weight for focal BCE term.")
+                tversky_weight = gr.Number(value=1.0, label="Tversky Weight", info="Weight for Tversky term.")
+                focal_alpha = gr.Number(value=0.25, label="Focal Alpha", info="Alpha balance for focal BCE.")
+                focal_gamma = gr.Number(value=2.0, label="Focal Gamma", info="Gamma focusing parameter for focal BCE.")
+                tversky_alpha = gr.Number(value=0.7, label="Tversky Alpha", info="False-negative weight in Tversky loss.")
+                tversky_beta = gr.Number(value=0.3, label="Tversky Beta", info="False-positive weight in Tversky loss.")
         with gr.Group(visible=False) as semantic_preserve_controls:
             gr.Markdown(
                 "Semantic-preserve weights: `Preserve Weight` scales feature-preservation loss; "
@@ -268,6 +319,11 @@ def build_tab(root: Path) -> None:
             fn=_toggle_semantic_controls,
             inputs=[training_strategy],
             outputs=[semantic_preserve_controls],
+        )
+        segmentation_loss.change(
+            fn=_toggle_segmentation_loss_controls,
+            inputs=[segmentation_loss],
+            outputs=[seg_loss_mcc_controls, seg_loss_focal_tversky_controls],
         )
         train_btn = gr.Button("Run Training", variant="primary")
         train_cmd = gr.Textbox(label="Command", interactive=False)
@@ -299,6 +355,8 @@ def build_tab(root: Path) -> None:
                 head_warmup_epoch,
                 fuser_unfreeze_epoch,
                 dinoup_unfreeze_epoch,
+                head_phase_lr_scale,
+                fuser_phase_lr_scale,
                 use_tile_cls_head,
                 use_zoom_cls_head,
                 tile_cls_weight,
@@ -312,9 +370,16 @@ def build_tab(root: Path) -> None:
                 lr_scheduler,
                 lr_min,
                 weight_decay,
+                segmentation_loss,
                 mcc_weight,
                 mcc_warmup_epochs,
                 bce_weight,
+                focal_weight,
+                tversky_weight,
+                focal_alpha,
+                focal_gamma,
+                tversky_alpha,
+                tversky_beta,
                 boundary_weight,
                 training_strategy,
                 preserve_weight,

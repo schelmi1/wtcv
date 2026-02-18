@@ -71,6 +71,8 @@ class Cfg:
     head_warmup_epoch: int = 1
     fuser_unfreeze_epoch: int = 2
     dinoup_unfreeze_epoch: int = 3
+    head_phase_lr_scale: float = 0.5
+    fuser_phase_lr_scale: float = 0.75
     use_tile_cls_head: bool = True
     tile_cls_weight: float = 0.3
     use_zoom_cls_head: bool = True
@@ -95,9 +97,16 @@ class Cfg:
     image_log_interval: int = 1
 
     iou_threshold: float = 0.5
+    segmentation_loss: str = "bce_mcc"  # bce_mcc | focal_bce_tversky
     mcc_weight: float = 0.4
     mcc_warmup_epochs: int = 3
     bce_weight: float = 0.5
+    focal_weight: float = 1.0
+    tversky_weight: float = 1.0
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
+    tversky_alpha: float = 0.7
+    tversky_beta: float = 0.3
     boundary_weight: float = 0.2
     training_strategy: str = "task_only"  # task_only | semantic_preserve
     preserve_weight: float = 0.10
@@ -801,8 +810,15 @@ def run_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     iou_threshold: float,
+    segmentation_loss: str,
     mcc_weight: float,
     bce_weight: float,
+    focal_weight: float,
+    tversky_weight: float,
+    focal_alpha: float,
+    focal_gamma: float,
+    tversky_alpha: float,
+    tversky_beta: float,
     boundary_weight: float,
     tile_cls_weight: float,
     zoom_cls_weight: float,
@@ -830,6 +846,8 @@ def run_epoch(
     total_losses = []
     mcc_losses = []
     bce_losses = []
+    focal_losses = []
+    tversky_losses = []
     boundary_losses = []
     tile_cls_losses = []
     zoom_cls_losses = []
@@ -872,8 +890,15 @@ def run_epoch(
                 tile_target=tile_t,
                 zoom_target=zoom_t,
                 fp_target=fp_t,
+                segmentation_loss=segmentation_loss,
                 mcc_weight=mcc_weight,
                 bce_weight=bce_weight,
+                focal_weight=focal_weight,
+                tversky_weight=tversky_weight,
+                focal_alpha=focal_alpha,
+                focal_gamma=focal_gamma,
+                tversky_alpha=tversky_alpha,
+                tversky_beta=tversky_beta,
                 boundary_weight=boundary_weight,
                 tile_cls_weight=tile_cls_weight,
                 zoom_cls_weight=zoom_cls_weight,
@@ -912,6 +937,8 @@ def run_epoch(
         total_losses.append(loss_val)
         mcc_losses.append(parts["mcc"])
         bce_losses.append(parts["bce"])
+        focal_losses.append(parts["focal"])
+        tversky_losses.append(parts["tversky"])
         boundary_losses.append(parts["boundary"])
         tile_cls_losses.append(parts["tile_cls"])
         zoom_cls_losses.append(parts["zoom_cls"])
@@ -957,8 +984,14 @@ def run_epoch(
         if writer is not None:
             gs = global_step_start + step_count
             writer.add_scalar(f"loss_step/{split_name}_total", loss_val, gs)
-            writer.add_scalar(f"loss_step/{split_name}_mcc", parts["mcc"], gs)
-            writer.add_scalar(f"loss_step/{split_name}_bce", parts["bce"], gs)
+            if not math.isnan(parts["mcc"]):
+                writer.add_scalar(f"loss_step/{split_name}_mcc", parts["mcc"], gs)
+            if not math.isnan(parts["bce"]):
+                writer.add_scalar(f"loss_step/{split_name}_bce", parts["bce"], gs)
+            if not math.isnan(parts["focal"]):
+                writer.add_scalar(f"loss_step/{split_name}_focal", parts["focal"], gs)
+            if not math.isnan(parts["tversky"]):
+                writer.add_scalar(f"loss_step/{split_name}_tversky", parts["tversky"], gs)
             writer.add_scalar(f"loss_step/{split_name}_boundary", parts["boundary"], gs)
             if not math.isnan(parts["tile_cls"]):
                 writer.add_scalar(f"loss_step/{split_name}_tile_cls", parts["tile_cls"], gs)
@@ -1014,6 +1047,8 @@ def run_epoch(
         "total_loss": float(np.mean(total_losses)) if total_losses else float("nan"),
         "mcc_loss": float(np.mean(mcc_losses)) if mcc_losses else float("nan"),
         "bce_loss": float(np.mean(bce_losses)) if bce_losses else float("nan"),
+        "focal_loss": _safe_nanmean(focal_losses),
+        "tversky_loss": _safe_nanmean(tversky_losses),
         "boundary_loss": float(np.mean(boundary_losses)) if boundary_losses else float("nan"),
         "tile_cls_loss": _safe_nanmean(tile_cls_losses),
         "zoom_cls_loss": _safe_nanmean(zoom_cls_losses),
@@ -1073,6 +1108,18 @@ def normalize_training_strategy(value: str) -> str:
         s = "task_only"
     if s not in {"task_only", "semantic_preserve"}:
         raise ValueError(f"Unsupported training_strategy: {value}")
+    return s
+
+
+def normalize_segmentation_loss(value: str) -> str:
+    s = str(value).strip().lower().replace(" ", "").replace("+", "_")
+    # Backward compatibility / aliases.
+    if s in {"bce+mcc", "mcc+bce", "mcc_bce"}:
+        s = "bce_mcc"
+    if s in {"focal_bce+tversky", "focal+tversky", "focalbce_tversky", "focaltversky"}:
+        s = "focal_bce_tversky"
+    if s not in {"bce_mcc", "focal_bce_tversky"}:
+        raise ValueError(f"Unsupported segmentation_loss: {value}")
     return s
 
 
@@ -1150,6 +1197,8 @@ def parse_args() -> Cfg:
     ap.add_argument("--head-warmup-epoch", type=int, default=1, help="Epoch to start training heads.")
     ap.add_argument("--fuser-unfreeze-epoch", type=int, default=2, help="Epoch to unfreeze fuse_1x1.")
     ap.add_argument("--dinoup-unfreeze-epoch", type=int, default=3, help="Epoch to unfreeze dino_up (and scheduled local branch).")
+    ap.add_argument("--head-phase-lr-scale", type=float, default=0.5, help="LR scale during head-only warmup phase.")
+    ap.add_argument("--fuser-phase-lr-scale", type=float, default=0.75, help="LR scale during fuser warmup phase.")
     ap.add_argument("--use-tile-cls-head", action="store_true", default=True)
     ap.add_argument("--no-use-tile-cls-head", action="store_false", dest="use_tile_cls_head")
     ap.add_argument("--tile-cls-weight", type=float, default=0.3)
@@ -1180,9 +1229,16 @@ def parse_args() -> Cfg:
     ap.add_argument("--image-log-interval", type=int, default=1)
 
     ap.add_argument("--iou-threshold", type=float, default=0.5)
+    ap.add_argument("--segmentation-loss", type=str, default="bce_mcc", help="Segmentation loss family: bce_mcc | focal_bce_tversky")
     ap.add_argument("--mcc-weight", type=float, default=0.4)
     ap.add_argument("--mcc-warmup-epochs", type=int, default=3)
     ap.add_argument("--bce-weight", type=float, default=0.5)
+    ap.add_argument("--focal-weight", type=float, default=1.0)
+    ap.add_argument("--tversky-weight", type=float, default=1.0)
+    ap.add_argument("--focal-alpha", type=float, default=0.25)
+    ap.add_argument("--focal-gamma", type=float, default=2.0)
+    ap.add_argument("--tversky-alpha", type=float, default=0.7)
+    ap.add_argument("--tversky-beta", type=float, default=0.3)
     ap.add_argument("--boundary-weight", type=float, default=0.2)
     ap.add_argument("--training-strategy", type=str, default="task_only")
     ap.add_argument("--preserve-weight", type=float, default=0.10)
@@ -1198,6 +1254,7 @@ def parse_args() -> Cfg:
     a = ap.parse_args()
 
     training_strategy = normalize_training_strategy(a.training_strategy)
+    segmentation_loss = normalize_segmentation_loss(a.segmentation_loss)
     local_unfreeze = normalize_local_unfreeze_mode(a.local_unfreeze)
 
     return Cfg(
@@ -1231,6 +1288,8 @@ def parse_args() -> Cfg:
         head_warmup_epoch=max(1, int(a.head_warmup_epoch)),
         fuser_unfreeze_epoch=max(1, int(a.fuser_unfreeze_epoch)),
         dinoup_unfreeze_epoch=max(1, int(a.dinoup_unfreeze_epoch)),
+        head_phase_lr_scale=float(max(0.0, min(1.0, a.head_phase_lr_scale))),
+        fuser_phase_lr_scale=float(max(0.0, min(1.0, a.fuser_phase_lr_scale))),
         use_tile_cls_head=a.use_tile_cls_head,
         tile_cls_weight=a.tile_cls_weight,
         use_zoom_cls_head=a.use_zoom_cls_head,
@@ -1251,9 +1310,16 @@ def parse_args() -> Cfg:
         val_example_items=a.val_example_items,
         image_log_interval=a.image_log_interval,
         iou_threshold=a.iou_threshold,
+        segmentation_loss=segmentation_loss,
         mcc_weight=a.mcc_weight,
         mcc_warmup_epochs=a.mcc_warmup_epochs,
         bce_weight=a.bce_weight,
+        focal_weight=a.focal_weight,
+        tversky_weight=a.tversky_weight,
+        focal_alpha=a.focal_alpha,
+        focal_gamma=a.focal_gamma,
+        tversky_alpha=a.tversky_alpha,
+        tversky_beta=a.tversky_beta,
         boundary_weight=a.boundary_weight,
         training_strategy=training_strategy,
         preserve_weight=a.preserve_weight,
@@ -1363,6 +1429,8 @@ def main() -> None:
         ("head_warmup_epoch", cfg.head_warmup_epoch),
         ("fuser_unfreeze_epoch", cfg.fuser_unfreeze_epoch),
         ("dinoup_unfreeze_epoch", cfg.dinoup_unfreeze_epoch),
+        ("head_phase_lr_scale", cfg.head_phase_lr_scale),
+        ("fuser_phase_lr_scale", cfg.fuser_phase_lr_scale),
         ("use_tile_cls_head", f"{cfg.use_tile_cls_head} (weight={cfg.tile_cls_weight})"),
         ("use_zoom_cls_head", f"{cfg.use_zoom_cls_head} (weight={cfg.zoom_cls_weight})"),
         (
@@ -1380,9 +1448,16 @@ def main() -> None:
     print_kv_rows(
         [
             ("training_strategy", cfg.training_strategy),
+            ("segmentation_loss", cfg.segmentation_loss),
             ("mcc_weight", cfg.mcc_weight),
             ("mcc_warmup_epochs", cfg.mcc_warmup_epochs),
             ("bce_weight", cfg.bce_weight),
+            ("focal_weight", cfg.focal_weight),
+            ("tversky_weight", cfg.tversky_weight),
+            ("focal_alpha", cfg.focal_alpha),
+            ("focal_gamma", cfg.focal_gamma),
+            ("tversky_alpha", cfg.tversky_alpha),
+            ("tversky_beta", cfg.tversky_beta),
             ("boundary_weight", cfg.boundary_weight),
             ("lr", cfg.lr),
             ("lr_scheduler", cfg.lr_scheduler),
@@ -1398,10 +1473,18 @@ def main() -> None:
             ),
         ]
     )
+    if cfg.segmentation_loss == "bce_mcc":
+        seg_formula = f"{cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + {cfg.boundary_weight}*boundary"
+    else:
+        seg_formula = (
+            f"{cfg.focal_weight}*focal_bce(alpha={cfg.focal_alpha},gamma={cfg.focal_gamma}) + "
+            f"{cfg.tversky_weight}*tversky(alpha={cfg.tversky_alpha},beta={cfg.tversky_beta}) + "
+            f"{cfg.boundary_weight}*boundary"
+        )
     print(
         "  loss_formula        : "
-        f"{cfg.mcc_weight}*mcc + {cfg.bce_weight}*bce + {cfg.boundary_weight}*boundary + "
-        f"{cfg.tile_cls_weight}*tile_cls + {cfg.zoom_cls_weight}*zoom_cls + {cfg.fp_neg_weight}*fp_sup(if enabled)"
+        f"{seg_formula} + {cfg.tile_cls_weight}*tile_cls + {cfg.zoom_cls_weight}*zoom_cls + "
+        f"{cfg.fp_neg_weight}*fp_sup(if enabled)"
     )
     if cfg.training_strategy == "semantic_preserve":
         print(
@@ -1583,6 +1666,14 @@ def main() -> None:
         n_trainable_now = sum(p.numel() for p in optimizer_params if p.requires_grad)
         return ", ".join(phase_parts), int(n_trainable_now)
 
+    def get_epoch_lr_scale(epoch_now: int) -> float:
+        e = int(epoch_now)
+        if e < int(cfg.fuser_unfreeze_epoch):
+            return float(cfg.head_phase_lr_scale)
+        if e < int(cfg.dinoup_unfreeze_epoch):
+            return float(cfg.fuser_phase_lr_scale)
+        return 1.0
+
     # Initialize schedule at epoch 1 (may be updated again once epoch loop starts/resume state is known).
     phase_desc, n_trainable_now = apply_epoch_unfreeze_schedule(1)
 
@@ -1725,19 +1816,28 @@ def main() -> None:
     last_phase_desc = ""
     for epoch in range(start_epoch, target_end_epoch + 1):
         phase_desc, n_trainable_now = apply_epoch_unfreeze_schedule(epoch)
+        lr_base_now = float(optimizer.param_groups[0]["lr"])
+        lr_scale_now = float(get_epoch_lr_scale(epoch))
+        lr_eff_now = max(float(cfg.lr_min), lr_base_now * lr_scale_now)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_eff_now
         if phase_desc != last_phase_desc:
             print(
                 f"epoch={epoch:02d} unfreeze_phase: {phase_desc} "
-                f"trainable_params={n_trainable_now:,}"
+                f"trainable_params={n_trainable_now:,} "
+                f"lr_base={lr_base_now:.8f} lr_scale={lr_scale_now:.3f} lr={lr_eff_now:.8f}"
             )
             last_phase_desc = phase_desc
 
         lr_now = float(optimizer.param_groups[0]["lr"])
-        epoch_mcc_weight = get_epoch_mcc_weight(
-            target_weight=cfg.mcc_weight,
-            warmup_epochs=cfg.mcc_warmup_epochs,
-            epoch=epoch,
-        )
+        if cfg.segmentation_loss == "bce_mcc":
+            epoch_mcc_weight = get_epoch_mcc_weight(
+                target_weight=cfg.mcc_weight,
+                warmup_epochs=cfg.mcc_warmup_epochs,
+                epoch=epoch,
+            )
+        else:
+            epoch_mcc_weight = 0.0
         epoch_preserve_weight = get_epoch_mcc_weight(
             target_weight=cfg.preserve_weight,
             warmup_epochs=cfg.preserve_warmup_epochs,
@@ -1771,8 +1871,15 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
             iou_threshold=cfg.iou_threshold,
+            segmentation_loss=cfg.segmentation_loss,
             mcc_weight=epoch_mcc_weight,
             bce_weight=cfg.bce_weight,
+            focal_weight=cfg.focal_weight,
+            tversky_weight=cfg.tversky_weight,
+            focal_alpha=cfg.focal_alpha,
+            focal_gamma=cfg.focal_gamma,
+            tversky_alpha=cfg.tversky_alpha,
+            tversky_beta=cfg.tversky_beta,
             boundary_weight=cfg.boundary_weight,
             tile_cls_weight=cfg.tile_cls_weight,
             zoom_cls_weight=cfg.zoom_cls_weight,
@@ -1801,6 +1908,8 @@ def main() -> None:
             "total_loss": float("nan"),
             "mcc_loss": float("nan"),
             "bce_loss": float("nan"),
+            "focal_loss": float("nan"),
+            "tversky_loss": float("nan"),
             "boundary_loss": float("nan"),
             "tile_cls_loss": float("nan"),
             "zoom_cls_loss": float("nan"),
@@ -1820,8 +1929,15 @@ def main() -> None:
                 optimizer=optimizer,
                 device=device,
                 iou_threshold=cfg.iou_threshold,
+                segmentation_loss=cfg.segmentation_loss,
                 mcc_weight=epoch_mcc_weight,
                 bce_weight=cfg.bce_weight,
+                focal_weight=cfg.focal_weight,
+                tversky_weight=cfg.tversky_weight,
+                focal_alpha=cfg.focal_alpha,
+                focal_gamma=cfg.focal_gamma,
+                tversky_alpha=cfg.tversky_alpha,
+                tversky_beta=cfg.tversky_beta,
                 boundary_weight=cfg.boundary_weight,
                 tile_cls_weight=cfg.tile_cls_weight,
                 zoom_cls_weight=cfg.zoom_cls_weight,
@@ -1847,6 +1963,8 @@ def main() -> None:
         row = {
             "epoch": epoch,
             "train_total": tr["total_loss"],
+            "train_focal_loss": tr["focal_loss"],
+            "train_tversky_loss": tr["tversky_loss"],
             "train_tile_cls_loss": tr["tile_cls_loss"],
             "train_zoom_cls_loss": tr["zoom_cls_loss"],
             "train_fp_sup_loss": tr["fp_sup_loss"],
@@ -1857,6 +1975,8 @@ def main() -> None:
             "train_neg_fp_rate": tr["neg_fp_rate"],
             "train_fp_activation": tr["fp_activation"],
             "val_total": va["total_loss"],
+            "val_focal_loss": va["focal_loss"],
+            "val_tversky_loss": va["tversky_loss"],
             "val_tile_cls_loss": va["tile_cls_loss"],
             "val_zoom_cls_loss": va["zoom_cls_loss"],
             "val_fp_sup_loss": va["fp_sup_loss"],
@@ -1872,15 +1992,18 @@ def main() -> None:
         print(
             f"epoch={epoch:02d} "
             f"lr={lr_now:.8f} "
+            f"lr_scale={lr_scale_now:.3f} "
             f"mcc_w={epoch_mcc_weight:.4f} "
             f"pres_w={epoch_preserve_weight:.4f} "
-            f"train_total={row['train_total']:.4f} train_tile_cls={row['train_tile_cls_loss']:.4f} "
+            f"train_total={row['train_total']:.4f} train_focal={row['train_focal_loss']:.4f} "
+            f"train_tversky={row['train_tversky_loss']:.4f} train_tile_cls={row['train_tile_cls_loss']:.4f} "
             f"train_zoom_cls={row['train_zoom_cls_loss']:.4f} train_fp_sup={row['train_fp_sup_loss']:.4f} "
             f"train_pres={row['train_preserve_loss']:.4f} train_var={row['train_var_loss']:.4f} "
             f"train_iou={row['train_iou']:.4f} "
             f"train_pos_iou={row['train_pos_iou']:.4f} train_neg_fp={row['train_neg_fp_rate']:.4f} "
             f"train_fp_act={row['train_fp_activation']:.4f} "
-            f"val_total={row['val_total']:.4f} val_tile_cls={row['val_tile_cls_loss']:.4f} "
+            f"val_total={row['val_total']:.4f} val_focal={row['val_focal_loss']:.4f} "
+            f"val_tversky={row['val_tversky_loss']:.4f} val_tile_cls={row['val_tile_cls_loss']:.4f} "
             f"val_zoom_cls={row['val_zoom_cls_loss']:.4f} val_fp_sup={row['val_fp_sup_loss']:.4f} "
             f"val_pres={row['val_preserve_loss']:.4f} val_var={row['val_var_loss']:.4f} "
             f"val_iou={row['val_iou']:.4f} "
@@ -1889,7 +2012,10 @@ def main() -> None:
         )
 
         writer.add_scalar("lr/epoch", lr_now, epoch)
+        writer.add_scalar("lr_scale/epoch", lr_scale_now, epoch)
         writer.add_scalar("loss_cfg/mcc_weight", epoch_mcc_weight, epoch)
+        writer.add_scalar("loss_cfg/focal_weight", float(cfg.focal_weight), epoch)
+        writer.add_scalar("loss_cfg/tversky_weight", float(cfg.tversky_weight), epoch)
         writer.add_scalar("loss_cfg/preserve_weight", epoch_preserve_weight, epoch)
         writer.add_scalar("metric/train_soft_iou", row["train_iou"], epoch)
         writer.add_scalar("metric/train_pos_iou", row["train_pos_iou"], epoch)
@@ -1898,6 +2024,10 @@ def main() -> None:
             writer.add_scalar("metric/train_fp_activation", row["train_fp_activation"], epoch)
         if not math.isnan(row["train_tile_cls_loss"]):
             writer.add_scalar("loss_epoch/train_tile_cls", row["train_tile_cls_loss"], epoch)
+        if not math.isnan(row["train_focal_loss"]):
+            writer.add_scalar("loss_epoch/train_focal", row["train_focal_loss"], epoch)
+        if not math.isnan(row["train_tversky_loss"]):
+            writer.add_scalar("loss_epoch/train_tversky", row["train_tversky_loss"], epoch)
         if not math.isnan(row["train_zoom_cls_loss"]):
             writer.add_scalar("loss_epoch/train_zoom_cls", row["train_zoom_cls_loss"], epoch)
         if not math.isnan(row["train_fp_sup_loss"]):
@@ -1916,6 +2046,10 @@ def main() -> None:
                 writer.add_scalar("metric/val_fp_activation", row["val_fp_activation"], epoch)
             if not math.isnan(row["val_tile_cls_loss"]):
                 writer.add_scalar("loss_epoch/val_tile_cls", row["val_tile_cls_loss"], epoch)
+            if not math.isnan(row["val_focal_loss"]):
+                writer.add_scalar("loss_epoch/val_focal", row["val_focal_loss"], epoch)
+            if not math.isnan(row["val_tversky_loss"]):
+                writer.add_scalar("loss_epoch/val_tversky", row["val_tversky_loss"], epoch)
             if not math.isnan(row["val_zoom_cls_loss"]):
                 writer.add_scalar("loss_epoch/val_zoom_cls", row["val_zoom_cls_loss"], epoch)
             if not math.isnan(row["val_fp_sup_loss"]):
