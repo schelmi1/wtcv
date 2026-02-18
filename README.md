@@ -44,6 +44,7 @@ Scripts migrated to use these shared helpers:
 - `sam1_box_to_poly_batched.py`
 - `fiftyone_object_umap.py`
 - `build_embedding_bank.py`
+- `unique_images_vs_embedding_bank.py`
 - `fiftyone_export_tagged_to_labelme.py`
 - `media_source_inference_cv2.py`
 - `train_stage1_seg.py`
@@ -391,6 +392,15 @@ Script: `report_object_cosine_similarity.py`
 Purpose:
 - Compute masked DINO embeddings for objects in a LabelMe folder.
 - Report highest and lowest cosine-similarity object pairs.
+- Reduce near-duplicate scene bias by filtering image-pair candidates using scene-level cosine similarity.
+
+Pipeline:
+1. Extract and embed all filtered objects in the input folder.
+2. Compute object-to-object cosine similarities.
+3. Aggregate scores into source image-pair rows.
+4. Compute scene/image embeddings for source images.
+5. Filter image-pair rows with scene cosine above `--max-image-similarity`.
+6. Export top/bottom pair reports and copied LabelMe pairs.
 
 Example:
 ```bash
@@ -398,6 +408,7 @@ python report_object_cosine_similarity.py \
   --input-dir /home/schelli/git/wtcv/data/record_pairs \
   --output-dir /home/schelli/git/wtcv/outputs/embedding_similarity \
   --label-filter vehicle \
+  --max-image-similarity 0.92 \
   --top-k 25
 ```
 
@@ -407,6 +418,48 @@ Outputs:
 - `cosine_similarity_embeddings.npz` (computed embeddings)
 - `top_pairs/` (only copied LabelMe image/json pairs for highest-cosine pairs)
 - `bottom_pairs/` (only copied LabelMe image/json pairs for lowest-cosine pairs)
+
+Notes:
+- This command does not preselect images before object embedding.
+- Scene similarity is a post-filter on image-pair candidates after object embeddings are computed.
+- `--max-image-similarity` controls that post-filter (lower = more scene diversity).
+- If you want scene preselection first, use `unique_images_vs_embedding_bank.py` (section 11).
+
+---
+
+### 11) Unique Scenes -> Object-vs-Bank
+Script: `unique_images_vs_embedding_bank.py`
+
+Purpose:
+- Rank new scenes by image-level uniqueness.
+- Keep the most unique images.
+- Score objects from these images against an existing embedding bank.
+
+Pipeline:
+1. Discover candidate images containing the requested labels.
+2. Compute one scene embedding per candidate image.
+3. Rank scene uniqueness using `--scene-knn`.
+4. Keep the top unique subset (`--unique-keep-count` or `--unique-keep-ratio`).
+5. Extract and embed objects only from selected images.
+6. Score object novelty versus bank embeddings (`1 - max_bank_cos`).
+
+Example:
+```bash
+python unique_images_vs_embedding_bank.py \
+  --input-dir /home/schelli/git/wtcv/data/record_pairs \
+  --bank-npz /home/schelli/git/wtcv/outputs/embedding_bank/embedding_bank.npz \
+  --output-dir /home/schelli/git/wtcv/outputs/unique_vs_bank \
+  --label-filter vehicle \
+  --scene-knn 5 \
+  --unique-keep-ratio 0.30
+```
+
+Outputs:
+- `scene_uniqueness.csv` (scene ranking by uniqueness)
+- `selected_unique_images.txt`
+- `selected_unique_labelme/` (copied valid LabelMe pairs for selected unique images)
+- `objects_vs_bank.csv` (object novelty vs bank)
+- `top_novel_objects.json`
 
 ## Notebooks
 
@@ -437,6 +490,7 @@ python sam1_box_to_poly_batched.py --help
 python augment_record_pairs_with_polygons.py --help
 python fiftyone_object_umap.py --help
 python build_embedding_bank.py --help
+python unique_images_vs_embedding_bank.py --help
 python report_object_cosine_similarity.py --help
 python fiftyone_export_tagged_to_labelme.py --help
 python media_source_inference_cv2.py --help

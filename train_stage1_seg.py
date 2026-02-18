@@ -62,11 +62,15 @@ class Cfg:
 
     fusion_channels: int = 256
     dino_upsampler_type: str = "learned"  # learned | pixelshuffle | anyup
+    dino_model_name: str = "dinov2_vits14_reg"
     dino_layers: str = "last"  # "last" or comma-separated 1-based layers, e.g. "6,9,12"
     anyup_q_chunk_size: int = 256
     local_backbone: str = "resnet18"  # resnet18 | resnet34 | resnet50
     local_unfreeze: str = "none"  # none | l1 | stem+1
     head_type: str = "pointwise"  # pointwise | dwsep | residual
+    head_warmup_epoch: int = 1
+    fuser_unfreeze_epoch: int = 2
+    dinoup_unfreeze_epoch: int = 3
     use_tile_cls_head: bool = True
     tile_cls_weight: float = 0.3
     use_zoom_cls_head: bool = True
@@ -503,6 +507,8 @@ class SegTileDataset(Dataset):
 
         seg_t = build_seg_target(self.tile_size, pos_objs_scaled, self.seg_out_stride)
         fp_t = build_seg_target(self.tile_size, fp_objs_scaled, self.seg_out_stride)
+        # Visualization-only full-resolution GT mask from the same augmented geometry.
+        seg_t_vis = build_seg_target(self.tile_size, pos_objs_scaled, out_stride=1)
 
         # Build a zoom ROI classification target:
         # positives use largest object bbox with context; negatives use deterministic random background crop.
@@ -571,6 +577,7 @@ class SegTileDataset(Dataset):
         return {
             "image": x,
             "seg_target": torch.from_numpy(seg_t).unsqueeze(0),
+            "seg_target_vis": torch.from_numpy(seg_t_vis).unsqueeze(0),
             "fp_target": torch.from_numpy(fp_t).unsqueeze(0),
             "tile_target": torch.tensor([float(item["is_object"])], dtype=torch.float32),
             "zoom_target": torch.tensor([float(zoom_target)], dtype=torch.float32),
@@ -644,15 +651,18 @@ def make_sample_figure(
 
     images = []
     targets = []
+    targets_vis = []
     metas = []
     for idx in idxs:
         s = dataset[int(idx)]
         images.append(s["image"])
         targets.append(s["seg_target"])
+        targets_vis.append(s.get("seg_target_vis", s["seg_target"]))
         metas.append(s["meta"])
 
     x = torch.stack(images, dim=0).to(device)
     seg_t = torch.stack(targets, dim=0)
+    seg_t_vis = torch.stack(targets_vis, dim=0)
 
     with torch.no_grad():
         pred = model(x)
@@ -666,8 +676,12 @@ def make_sample_figure(
     for i in range(n):
         img = unnormalize_image(x[i].detach().cpu())
         gt = seg_t[i, 0].numpy()
+        gt_vis = seg_t_vis[i, 0].numpy()
         pr = seg_p[i, 0].numpy()
-        gt_up = upsample_map_to_image(gt, img.shape[:2])
+        if gt_vis.shape == img.shape[:2]:
+            gt_up = gt_vis
+        else:
+            gt_up = upsample_map_to_image(gt_vis, img.shape[:2])
         pr_up = upsample_map_to_image(pr, img.shape[:2])
         # Left: image + GT polygon-like contour overlay.
         ax_l = axes[i, 0]
@@ -682,6 +696,92 @@ def make_sample_figure(
         ax_l.axis("off")
 
         # Right: prediction heatmap + predicted polyline at fixed threshold 0.5.
+        ax_r = axes[i, 1]
+        ax_r.imshow(pr_up, cmap="magma", vmin=0.0, vmax=1.0)
+        pr_min = float(np.min(pr_up))
+        pr_max = float(np.max(pr_up))
+        if pr_min <= pred_poly_thr <= pr_max:
+            ax_r.contour(pr_up, levels=[pred_poly_thr], colors=["#00ffff"], linewidths=1.6)
+        ax_r.set_title(f"Pred heatmap + poly@{pred_poly_thr:.1f}")
+        ax_r.axis("off")
+
+    plt.tight_layout()
+    return fig
+
+
+def _meta_value_at(meta_batch: Dict, key: str, i: int, default=None):
+    if not isinstance(meta_batch, dict):
+        return default
+    if key not in meta_batch:
+        return default
+    v = meta_batch.get(key)
+    if torch.is_tensor(v):
+        if v.ndim == 0:
+            return v.item()
+        if i < int(v.shape[0]):
+            x = v[i]
+            return x.item() if torch.is_tensor(x) and x.ndim == 0 else x
+        return default
+    if isinstance(v, (list, tuple)):
+        if i < len(v):
+            return v[i]
+        return default
+    return v
+
+
+def make_batch_figure(
+    image_batch: torch.Tensor,
+    seg_target_batch: torch.Tensor,
+    seg_target_vis_batch: Optional[torch.Tensor],
+    seg_prob_batch: torch.Tensor,
+    tile_target_batch: Optional[torch.Tensor],
+    meta_batch: Optional[Dict],
+    max_items: int,
+    title_prefix: str,
+):
+    n = int(min(max_items, int(image_batch.shape[0])))
+    if n <= 0:
+        return None
+
+    fig, axes = plt.subplots(n, 2, figsize=(9.5, 3.6 * n))
+    if n == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    pred_poly_thr = 0.5
+    for i in range(n):
+        img = unnormalize_image(image_batch[i])
+        gt = seg_target_batch[i, 0].numpy()
+        gt_vis = None
+        if seg_target_vis_batch is not None and i < int(seg_target_vis_batch.shape[0]):
+            gt_vis = seg_target_vis_batch[i, 0].numpy()
+        pr = seg_prob_batch[i, 0].numpy()
+        if gt_vis is not None:
+            if gt_vis.shape == img.shape[:2]:
+                gt_up = gt_vis
+            else:
+                gt_up = upsample_map_to_image(gt_vis, img.shape[:2])
+        else:
+            gt_up = upsample_map_to_image(gt, img.shape[:2])
+        pr_up = upsample_map_to_image(pr, img.shape[:2])
+
+        num_objs = _meta_value_at(meta_batch or {}, "num_objects", i, 0)
+        num_fp = _meta_value_at(meta_batch or {}, "num_fp_objects", i, 0)
+        is_pos = None
+        if tile_target_batch is not None and i < int(tile_target_batch.shape[0]):
+            is_pos = int(float(tile_target_batch[i, 0].item()) > 0.5)
+
+        ax_l = axes[i, 0]
+        ax_l.imshow(img)
+        gt_min = float(np.min(gt_up))
+        gt_max = float(np.max(gt_up))
+        if gt_min <= 0.5 <= gt_max:
+            ax_l.contour(gt_up, levels=[0.5], colors=["#00ffd5"], linewidths=1.6)
+        ttl = f"{title_prefix} | ACTUAL batch image + GT\nobjs={int(num_objs)} fp_objs={int(num_fp)}"
+        if is_pos is not None:
+            ttl = f"{ttl} pos={is_pos}"
+        ax_l.set_title(ttl)
+        ax_l.axis("off")
+
         ax_r = axes[i, 1]
         ax_r.imshow(pr_up, cmap="magma", vmin=0.0, vmax=1.0)
         pr_min = float(np.min(pr_up))
@@ -721,6 +821,7 @@ def run_epoch(
     writer: SummaryWriter | None = None,
     global_step_start: int = 0,
     dataloader_verbose: bool = False,
+    capture_example_batch: bool = False,
 ):
     model.train(train)
     if not train:
@@ -744,6 +845,7 @@ def run_epoch(
     pbar = tqdm(loader, desc=f"{split_name} epoch {epoch:02d}", leave=dataloader_verbose)
     step_count = 0
     last_step_time = time.time()
+    example_batch = None
     for batch in pbar:
         now = time.time()
         data_time = now - last_step_time
@@ -842,6 +944,16 @@ def run_epoch(
                         if hs > prev:
                             hard_scores[int(ds_idx)] = hs
 
+        if capture_example_batch and example_batch is None:
+            example_batch = {
+                "image": x.detach().cpu(),
+                "seg_target": seg_t.detach().cpu(),
+                "seg_target_vis": batch.get("seg_target_vis", seg_t).detach().cpu(),
+                "seg_prob": torch.sigmoid(pred["seg_logit"].detach()).cpu(),
+                "tile_target": tile_t.detach().cpu(),
+                "meta": batch.get("meta", {}),
+            }
+
         if writer is not None:
             gs = global_step_start + step_count
             writer.add_scalar(f"loss_step/{split_name}_total", loss_val, gs)
@@ -916,6 +1028,7 @@ def run_epoch(
         "mask_iou": _safe_nanmean(soft_iou_scores),
         "hard_scores": hard_scores,
         "num_steps": int(step_count),
+        "example_batch": example_batch,
     }
 
 
@@ -974,25 +1087,21 @@ def normalize_local_unfreeze_mode(value: str) -> str:
     raise ValueError(f"Unsupported local_unfreeze mode: {value}. Use one of: none, l1, stem+1")
 
 
-def apply_local_resnet_unfreeze(local_module: nn.Module, mode: str) -> List[str]:
+def get_local_resnet_unfreeze_modules(local_module: nn.Module, mode: str) -> List[Tuple[str, nn.Module]]:
     mode = normalize_local_unfreeze_mode(mode)
     if mode == "none":
         return []
-
-    unfrozen: List[str] = []
     if mode == "l1":
-        for p in local_module.l1.parameters():
-            p.requires_grad = True
-        unfrozen.append("local.l1")
-        return unfrozen
-
+        return [("local.l1", local_module.l1)]
     # stem+1
-    for p in local_module.stem.parameters():
-        p.requires_grad = True
-    for p in local_module.l1.parameters():
-        p.requires_grad = True
-    unfrozen.extend(["local.stem", "local.l1"])
-    return unfrozen
+    return [("local.stem", local_module.stem), ("local.l1", local_module.l1)]
+
+
+def set_module_requires_grad(module: Optional[nn.Module], enabled: bool) -> None:
+    if module is None:
+        return
+    for p in module.parameters():
+        p.requires_grad = bool(enabled)
 
 
 def parse_args() -> Cfg:
@@ -1027,6 +1136,7 @@ def parse_args() -> Cfg:
     ap.add_argument("--fusion-channels", type=int, default=256)
     ap.add_argument("--dino-upsampler", dest="dino_upsampler_type", type=str, choices=["learned", "pixelshuffle", "anyup"], default="learned")
     ap.add_argument("--dino-upsampler-type", dest="dino_upsampler_type", type=str, choices=["learned", "pixelshuffle", "anyup"], help=argparse.SUPPRESS)
+    ap.add_argument("--dino-model", type=str, default="dinov2_vits14_reg", help="torch.hub DINOv2 model id, e.g. dinov2_vits14_reg, dinov2_vitb14_reg, dinov2_vitl14_reg")
     ap.add_argument("--dino-layers", type=str, default="last", help="DINO layers: 'last' or comma-separated 1-based ids (e.g. 6,9,12)")
     ap.add_argument("--anyup-q-chunk-size", type=int, default=256)
     ap.add_argument("--local-backbone", type=str, choices=["resnet18", "resnet34", "resnet50"], default="resnet18")
@@ -1037,6 +1147,9 @@ def parse_args() -> Cfg:
         help="Unfreeze mode for local ResNet branch: none | l1 | stem+1",
     )
     ap.add_argument("--head-type", type=str, choices=["pointwise", "dwsep", "residual"], default="pointwise")
+    ap.add_argument("--head-warmup-epoch", type=int, default=1, help="Epoch to start training heads.")
+    ap.add_argument("--fuser-unfreeze-epoch", type=int, default=2, help="Epoch to unfreeze fuse_1x1.")
+    ap.add_argument("--dinoup-unfreeze-epoch", type=int, default=3, help="Epoch to unfreeze dino_up (and scheduled local branch).")
     ap.add_argument("--use-tile-cls-head", action="store_true", default=True)
     ap.add_argument("--no-use-tile-cls-head", action="store_false", dest="use_tile_cls_head")
     ap.add_argument("--tile-cls-weight", type=float, default=0.3)
@@ -1109,11 +1222,15 @@ def parse_args() -> Cfg:
         weight_decay=a.weight_decay,
         fusion_channels=a.fusion_channels,
         dino_upsampler_type=a.dino_upsampler_type,
+        dino_model_name=a.dino_model,
         dino_layers=a.dino_layers,
         anyup_q_chunk_size=a.anyup_q_chunk_size,
         local_backbone=a.local_backbone,
         local_unfreeze=local_unfreeze,
         head_type=a.head_type,
+        head_warmup_epoch=max(1, int(a.head_warmup_epoch)),
+        fuser_unfreeze_epoch=max(1, int(a.fuser_unfreeze_epoch)),
+        dinoup_unfreeze_epoch=max(1, int(a.dinoup_unfreeze_epoch)),
         use_tile_cls_head=a.use_tile_cls_head,
         tile_cls_weight=a.tile_cls_weight,
         use_zoom_cls_head=a.use_zoom_cls_head,
@@ -1239,9 +1356,13 @@ def main() -> None:
     print_section("Model + Heads")
     rows_model: List[Tuple[str, object]] = [
         ("dino_upsampler_type", cfg.dino_upsampler_type),
+        ("dino_model_name", cfg.dino_model_name),
         ("dino_layers", cfg.dino_layers),
         ("local_backbone", cfg.local_backbone),
         ("local_unfreeze", cfg.local_unfreeze),
+        ("head_warmup_epoch", cfg.head_warmup_epoch),
+        ("fuser_unfreeze_epoch", cfg.fuser_unfreeze_epoch),
+        ("dinoup_unfreeze_epoch", cfg.dinoup_unfreeze_epoch),
         ("use_tile_cls_head", f"{cfg.use_tile_cls_head} (weight={cfg.tile_cls_weight})"),
         ("use_zoom_cls_head", f"{cfg.use_zoom_cls_head} (weight={cfg.zoom_cls_weight})"),
         (
@@ -1380,6 +1501,7 @@ def main() -> None:
         channels=cfg.fusion_channels,
         trust_repo=cfg.trust_torch_hub_repo,
         dino_upsampler_type=cfg.dino_upsampler_type,
+        dino_model_name=cfg.dino_model_name,
         dino_layers=cfg.dino_layers,
         anyup_q_chunk_size=cfg.anyup_q_chunk_size,
         local_backbone=cfg.local_backbone,
@@ -1388,45 +1510,104 @@ def main() -> None:
         use_zoom_cls_head=cfg.use_zoom_cls_head,
     ).to(device)
 
-    # Freeze both backbones to reduce overfitting.
-    for p in model.dino.parameters():
-        p.requires_grad = False
-    local_unfrozen_modules: List[str] = []
+    # Always keep DINO backbone frozen.
+    set_module_requires_grad(model.dino, False)
+
+    # Candidate trainable module groups for staged unfreeze.
+    if cfg.dino_upsampler_type == "anyup":
+        head_modules: List[nn.Module] = [model.anyup_head]
+    else:
+        head_modules = [model.head]
+    if cfg.use_tile_cls_head and model.tile_cls_head is not None:
+        head_modules.append(model.tile_cls_head)
+    if cfg.use_zoom_cls_head and model.zoom_cls_head is not None:
+        head_modules.append(model.zoom_cls_head)
+
+    fuser_module: Optional[nn.Module] = model.fuse_1x1 if cfg.dino_upsampler_type != "anyup" else None
+    dinoup_module: Optional[nn.Module] = model.dino_up if cfg.dino_upsampler_type != "anyup" else None
+
+    local_sched_modules: List[Tuple[str, nn.Module]] = []
     if model.local is not None:
-        for p in model.local.parameters():
-            p.requires_grad = False
-        local_unfrozen_modules = apply_local_resnet_unfreeze(model.local, cfg.local_unfreeze)
+        set_module_requires_grad(model.local, False)
+        local_sched_modules = get_local_resnet_unfreeze_modules(model.local, cfg.local_unfreeze)
     elif cfg.local_unfreeze != "none":
         print(
             f"warning: local_unfreeze={cfg.local_unfreeze} requested, but local branch is disabled "
             f"(dino_upsampler_type={cfg.dino_upsampler_type}); ignoring."
         )
-    # In anyup mode, keep the learned upsampler frozen and use AnyUp directly.
-    if cfg.dino_upsampler_type == "anyup":
-        for p in model.dino_up.parameters():
-            p.requires_grad = False
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    if cfg.dino_upsampler_type == "anyup":
+        # Keep learned upsampler frozen when AnyUp is active.
+        set_module_requires_grad(model.dino_up, False)
+
+    # Optimizer sees all potentially trainable parameters; requires_grad schedule controls updates.
+    candidate_modules: List[nn.Module] = []
+    candidate_modules.extend([m for m in head_modules if m is not None])
+    if fuser_module is not None:
+        candidate_modules.append(fuser_module)
+    if dinoup_module is not None:
+        candidate_modules.append(dinoup_module)
+    candidate_modules.extend([m for _name, m in local_sched_modules])
+
+    seen_param_ids = set()
+    optimizer_params: List[nn.Parameter] = []
+    for mod in candidate_modules:
+        for p in mod.parameters():
+            pid = id(p)
+            if pid in seen_param_ids:
+                continue
+            seen_param_ids.add(pid)
+            optimizer_params.append(p)
+    if len(optimizer_params) == 0:
+        raise RuntimeError("No optimizer parameters collected for training schedule.")
+
+    def apply_epoch_unfreeze_schedule(epoch_now: int) -> Tuple[str, int]:
+        heads_on = int(epoch_now) >= int(cfg.head_warmup_epoch)
+        fuser_on = (fuser_module is not None) and (int(epoch_now) >= int(cfg.fuser_unfreeze_epoch))
+        dinoup_on = (dinoup_module is not None) and (int(epoch_now) >= int(cfg.dinoup_unfreeze_epoch))
+        local_on = (len(local_sched_modules) > 0) and (int(epoch_now) >= int(cfg.dinoup_unfreeze_epoch))
+
+        for m in head_modules:
+            set_module_requires_grad(m, heads_on)
+        set_module_requires_grad(fuser_module, fuser_on)
+        set_module_requires_grad(dinoup_module, dinoup_on)
+        for _name, m in local_sched_modules:
+            set_module_requires_grad(m, local_on)
+
+        phase_parts = [
+            f"heads={'on' if heads_on else 'off'}",
+            f"fuser={'on' if fuser_on else 'off'}",
+            f"dinoup={'on' if dinoup_on else 'off'}",
+            f"local={'on' if local_on else 'off'}",
+        ]
+        n_trainable_now = sum(p.numel() for p in optimizer_params if p.requires_grad)
+        return ", ".join(phase_parts), int(n_trainable_now)
+
+    # Initialize schedule at epoch 1 (may be updated again once epoch loop starts/resume state is known).
+    phase_desc, n_trainable_now = apply_epoch_unfreeze_schedule(1)
+
+    optimizer = torch.optim.AdamW(optimizer_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = build_lr_scheduler(optimizer, cfg)
 
     if cfg.dino_upsampler_type == "anyup":
-        module_msg = f"anyup_head[{cfg.head_type}] (AnyUp + backbones frozen)"
+        module_msg = f"anyup_head[{cfg.head_type}] (AnyUp + backbones frozen; staged heads)"
     else:
-        module_msg = "dino_up, fuse_1x1, head"
+        module_msg = "staged: heads -> fuser -> dino_up/local"
     if cfg.use_tile_cls_head:
         module_msg = f"{module_msg}, tile_cls_head"
     if cfg.use_zoom_cls_head:
         module_msg = f"{module_msg}, zoom_cls_head"
-    if len(local_unfrozen_modules) > 0:
-        module_msg = f"{module_msg}, {', '.join(local_unfrozen_modules)}"
+    if len(local_sched_modules) > 0:
+        module_msg = f"{module_msg}, {', '.join([n for n, _m in local_sched_modules])}"
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in trainable)
+    trainable_params_max = sum(p.numel() for p in optimizer_params)
     print_kv_rows(
         [
             ("trainable_modules", module_msg),
-            ("local_unfrozen", ", ".join(local_unfrozen_modules) if local_unfrozen_modules else "none"),
-            ("trainable_params", f"{trainable_params:,}"),
+            ("local_schedule", ", ".join([n for n, _m in local_sched_modules]) if local_sched_modules else "none"),
+            ("trainable_phase(epoch1)", phase_desc),
+            ("trainable_params(epoch1)", f"{n_trainable_now:,}"),
+            ("trainable_params(max)", f"{trainable_params_max:,}"),
             ("total_params", f"{total_params:,}"),
             ("optimizer", "AdamW"),
             ("scheduler", cfg.lr_scheduler),
@@ -1447,8 +1628,8 @@ def main() -> None:
             f"frozen={root_direct - root_direct_trainable:,} total={root_direct:,}"
         )
     print(
-        f"    - {'TOTAL':14s} trainable={trainable_params:,} "
-        f"frozen={total_params - trainable_params:,} total={total_params:,}"
+        f"    - {'TOTAL':14s} trainable={n_trainable_now:,} "
+        f"frozen={total_params - n_trainable_now:,} total={total_params:,}"
     )
 
     history = []
@@ -1541,7 +1722,16 @@ def main() -> None:
         )
         return
 
+    last_phase_desc = ""
     for epoch in range(start_epoch, target_end_epoch + 1):
+        phase_desc, n_trainable_now = apply_epoch_unfreeze_schedule(epoch)
+        if phase_desc != last_phase_desc:
+            print(
+                f"epoch={epoch:02d} unfreeze_phase: {phase_desc} "
+                f"trainable_params={n_trainable_now:,}"
+            )
+            last_phase_desc = phase_desc
+
         lr_now = float(optimizer.param_groups[0]["lr"])
         epoch_mcc_weight = get_epoch_mcc_weight(
             target_weight=cfg.mcc_weight,
@@ -1601,6 +1791,7 @@ def main() -> None:
             writer=writer,
             global_step_start=train_global_step,
             dataloader_verbose=cfg.dataloader_verbose,
+            capture_example_batch=True,
         )
         train_global_step += int(tr.get("num_steps", 0))
         if cfg.hard_negative_mining:
@@ -1649,6 +1840,7 @@ def main() -> None:
                 writer=writer,
                 global_step_start=val_global_step,
                 dataloader_verbose=cfg.dataloader_verbose,
+                capture_example_batch=True,
             )
             val_global_step += int(va.get("num_steps", 0))
 
@@ -1739,27 +1931,55 @@ def main() -> None:
             scheduler.step()
 
         if epoch % cfg.image_log_interval == 0:
-            train_fig = make_sample_figure(
-                model=model,
-                dataset=train_ds,
-                device=device,
-                max_items=cfg.train_example_items,
-                thr=cfg.iou_threshold,
-                title_prefix="Train",
-                positives_only=False,
-            )
+            train_fig = None
+            tr_batch = tr.get("example_batch", None)
+            if tr_batch is not None:
+                train_fig = make_batch_figure(
+                    image_batch=tr_batch["image"],
+                    seg_target_batch=tr_batch["seg_target"],
+                    seg_target_vis_batch=tr_batch.get("seg_target_vis", None),
+                    seg_prob_batch=tr_batch["seg_prob"],
+                    tile_target_batch=tr_batch.get("tile_target", None),
+                    meta_batch=tr_batch.get("meta", None),
+                    max_items=cfg.train_example_items,
+                    title_prefix="Train",
+                )
+            if train_fig is None:
+                train_fig = make_sample_figure(
+                    model=model,
+                    dataset=train_ds,
+                    device=device,
+                    max_items=cfg.train_example_items,
+                    thr=cfg.iou_threshold,
+                    title_prefix="Train",
+                    positives_only=False,
+                )
             writer.add_figure("examples/train", train_fig, global_step=epoch)
             plt.close(train_fig)
 
-            val_fig = make_sample_figure(
-                model=model,
-                dataset=val_ds,
-                device=device,
-                max_items=cfg.val_example_items,
-                thr=cfg.iou_threshold,
-                title_prefix="Val",
-                positives_only=False,
-            )
+            val_fig = None
+            va_batch = va.get("example_batch", None) if isinstance(va, dict) else None
+            if va_batch is not None:
+                val_fig = make_batch_figure(
+                    image_batch=va_batch["image"],
+                    seg_target_batch=va_batch["seg_target"],
+                    seg_target_vis_batch=va_batch.get("seg_target_vis", None),
+                    seg_prob_batch=va_batch["seg_prob"],
+                    tile_target_batch=va_batch.get("tile_target", None),
+                    meta_batch=va_batch.get("meta", None),
+                    max_items=cfg.val_example_items,
+                    title_prefix="Val",
+                )
+            if val_fig is None:
+                val_fig = make_sample_figure(
+                    model=model,
+                    dataset=val_ds,
+                    device=device,
+                    max_items=cfg.val_example_items,
+                    thr=cfg.iou_threshold,
+                    title_prefix="Val",
+                    positives_only=False,
+                )
             writer.add_figure("examples/val", val_fig, global_step=epoch)
             plt.close(val_fig)
 

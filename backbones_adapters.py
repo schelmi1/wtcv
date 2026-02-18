@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -11,22 +11,55 @@ import torchvision
 
 
 class FrozenDinoTokenBranch(nn.Module):
+    @staticmethod
+    def _parse_layer_spec(
+        spec: Union[str, Sequence[int], None],
+        depth: int,
+    ) -> Tuple[int, ...]:
+        if spec is None:
+            return (depth - 1,)
+        if isinstance(spec, (list, tuple)):
+            vals = [int(v) for v in spec]
+        else:
+            s = str(spec).strip().lower()
+            if s in {"", "last", "final"}:
+                return (depth - 1,)
+            vals = []
+            for part in s.split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                vals.append(int(p))
+        if len(vals) == 0:
+            return (depth - 1,)
+
+        out = []
+        for v in vals:
+            idx = v - 1 if v >= 1 else v
+            if idx < 0 or idx >= depth:
+                raise ValueError(f"Invalid dino layer '{v}' for depth={depth}. Expected 1..{depth}.")
+            out.append(int(idx))
+        return tuple(out)
+
     def __init__(
         self,
         out_channels: int = 256,
         trust_repo: bool = True,
+        model_name: str = "dinov2_vits14_reg",
+        layer_spec: Union[str, Sequence[int], None] = "last",
         layer_indices: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         self.backbone = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_vits14_reg", trust_repo=trust_repo
+            "facebookresearch/dinov2", str(model_name), trust_repo=trust_repo
         )
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
         self.depth = int(len(self.backbone.blocks))
+        self.model_name = str(model_name)
         if layer_indices is None:
-            self.layer_indices = (self.depth - 1,)
+            self.layer_indices = self._parse_layer_spec(layer_spec, depth=self.depth)
         else:
             idx = [int(v) for v in layer_indices]
             if len(idx) == 0:

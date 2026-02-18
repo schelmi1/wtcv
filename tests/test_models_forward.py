@@ -99,16 +99,22 @@ def mock_model_deps(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize("dino_upsampler_type", ["learned", "pixelshuffle"])
-def test_stage1segnet_learned_forward_shapes(dino_upsampler_type: str, mock_model_deps) -> None:
+@pytest.mark.parametrize("head_type", ["pointwise", "dwsep", "residual"])
+def test_stage1segnet_learned_forward_shapes(
+    dino_upsampler_type: str,
+    head_type: str,
+    mock_model_deps,
+) -> None:
     _print_headline(
         adapter=dino_upsampler_type,
-        head="segmentation_head",
+        head=head_type,
         tile_cls=True,
         zoom_cls=True,
     )
     model = Stage1SegNet(
         channels=64,
         dino_upsampler_type=dino_upsampler_type,
+        head_type=head_type,
         use_tile_cls_head=True,
         use_zoom_cls_head=True,
     ).eval()

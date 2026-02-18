@@ -12,6 +12,9 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
+import torchvision
+from torchvision.transforms import functional as TF
 
 from build_embedding_bank import compute_bank, iter_object_tiles
 
@@ -39,6 +42,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-trust-torch-hub-repo", action="store_false", dest="trust_torch_hub_repo")
     ap.add_argument("--device", type=str, default="", help="cuda|cpu; blank means auto")
     ap.add_argument("--top-k", type=int, default=25, help="How many high/low pairs to report")
+    ap.add_argument(
+        "--max-image-similarity",
+        type=float,
+        default=0.92,
+        help="Drop candidate pairs whose source-image cosine similarity is above this threshold",
+    )
+    ap.add_argument("--image-embed-size", type=int, default=448, help="Square resize used for scene embeddings")
+    ap.add_argument("--image-embed-batch-size", type=int, default=12, help="Batch size for scene embedding extraction")
     return ap.parse_args()
 
 
@@ -46,6 +57,8 @@ def _build_pair_reports(
     embeddings: np.ndarray,
     metadata: List[Dict],
     top_k: int,
+    image_embeddings: Dict[str, np.ndarray],
+    max_image_similarity: float,
 ) -> Tuple[List[Dict], List[Dict], Dict]:
     n = int(embeddings.shape[0])
     if n < 2:
@@ -104,15 +117,23 @@ def _build_pair_reports(
         raise RuntimeError("No valid similarity pairs found")
 
     rows: List[Dict] = []
+    pre_filter_count = 0
     for key, g in grouped.items():
         a_img, a_json, b_img, b_json = key
         cnt = int(g["count"])
+        ea = image_embeddings.get(a_img)
+        eb = image_embeddings.get(b_img)
+        scene_score = float(np.dot(ea, eb)) if (ea is not None and eb is not None) else float("nan")
+        pre_filter_count += 1
+        if np.isfinite(scene_score) and scene_score > float(max_image_similarity):
+            continue
         rows.append(
             {
                 "score": float(g["sum"] / max(1, cnt)),  # mean cosine across all object-object pairs for this source pair
                 "pair_count": cnt,
                 "score_min": float(g["min"]),
                 "score_max": float(g["max"]),
+                "scene_score": scene_score,
                 "a_image": a_img,
                 "a_json": a_json,
                 "b_image": b_img,
@@ -120,6 +141,11 @@ def _build_pair_reports(
                 "a_label": ",".join(sorted(str(x) for x in g["a_labels"])),
                 "b_label": ",".join(sorted(str(x) for x in g["b_labels"])),
             }
+        )
+    if not rows:
+        raise RuntimeError(
+            f"No pairs left after scene filter (max_image_similarity={float(max_image_similarity):.3f}). "
+            "Try a higher threshold."
         )
 
     rows.sort(key=lambda r: float(r["score"]))
@@ -135,6 +161,9 @@ def _build_pair_reports(
         "score_mean": float(all_scores.mean()),
         "score_median": float(np.median(all_scores)),
         "score_max": float(all_scores.max()),
+        "num_pairs_pre_scene_filter": int(pre_filter_count),
+        "num_pairs_post_scene_filter": int(len(rows)),
+        "max_image_similarity": float(max_image_similarity),
     }
     return high, low, summary
 
@@ -175,10 +204,66 @@ def _print_rows(title: str, rows: Sequence[Dict]) -> None:
         b_img = Path(str(r["b_image"])).name
         print(
             f"[{i:02d}] mean_cos={float(r['score']):.4f} n={int(r['pair_count'])} "
-            f"(min={float(r['score_min']):.4f}, max={float(r['score_max']):.4f}) | "
+            f"(min={float(r['score_min']):.4f}, max={float(r['score_max']):.4f}, scene={float(r['scene_score']):.4f}) | "
             f"A: {a_img} ({r['a_label']}) | "
             f"B: {b_img} ({r['b_label']})"
         )
+
+
+def _load_image_tensor(path: Path, image_size: int) -> torch.Tensor:
+    with Image.open(path) as im:
+        img = im.convert("RGB").resize((int(image_size), int(image_size)), Image.BILINEAR)
+    x = TF.to_tensor(img)
+    norm = torchvision.transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    return norm(x)
+
+
+def _compute_image_embeddings(
+    image_paths: Sequence[str],
+    dino_model_name: str,
+    device: torch.device,
+    trust_repo: bool,
+    image_size: int,
+    batch_size: int,
+) -> Dict[str, np.ndarray]:
+    model = torch.hub.load("facebookresearch/dinov2", dino_model_name, trust_repo=trust_repo).to(device).eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    out: Dict[str, np.ndarray] = {}
+    pending_t: List[torch.Tensor] = []
+    pending_k: List[str] = []
+
+    def flush() -> None:
+        nonlocal pending_t, pending_k
+        if not pending_t:
+            return
+        x = torch.stack(pending_t, dim=0).to(device)
+        with torch.inference_mode():
+            feats = model.forward_features(x)
+            tok = feats["x_norm_patchtokens"]  # (B,N,C)
+            vec = tok.mean(dim=1)
+            vec = F.normalize(vec, dim=1)
+        arr = vec.detach().cpu().numpy().astype(np.float32)
+        for i, k in enumerate(pending_k):
+            out[k] = arr[i]
+        pending_t = []
+        pending_k = []
+
+    for p in image_paths:
+        ip = Path(str(p))
+        if not ip.exists():
+            continue
+        try:
+            t = _load_image_tensor(ip, image_size=int(image_size))
+        except Exception:
+            continue
+        pending_t.append(t)
+        pending_k.append(str(ip))
+        if len(pending_t) >= max(1, int(batch_size)):
+            flush()
+    flush()
+    return out
 
 
 def _copy_labelme_pair_files(
@@ -298,10 +383,23 @@ def main() -> None:
     )
     print(f"objects={len(metadata)} embedding_dim={embeddings.shape[1]}")
 
+    unique_images = sorted({str(m.get("source_image_path", "")) for m in metadata if str(m.get("source_image_path", ""))})
+    image_embeddings = _compute_image_embeddings(
+        image_paths=unique_images,
+        dino_model_name=str(args.dino_model),
+        device=device,
+        trust_repo=bool(args.trust_torch_hub_repo),
+        image_size=int(args.image_embed_size),
+        batch_size=int(args.image_embed_batch_size),
+    )
+    print(f"scene_embeddings={len(image_embeddings)}")
+
     high_rows, low_rows, summary = _build_pair_reports(
         embeddings=embeddings,
         metadata=metadata,
         top_k=int(args.top_k),
+        image_embeddings=image_embeddings,
+        max_image_similarity=float(args.max_image_similarity),
     )
     high_rows, low_rows = _select_unique_source_rows(high_rows=high_rows, low_rows=low_rows)
 
@@ -328,6 +426,7 @@ def main() -> None:
                 "pair_count",
                 "score_min",
                 "score_max",
+                "scene_score",
                 "a_label",
                 "b_label",
                 "a_image",

@@ -182,6 +182,7 @@ class Stage1SegNet(nn.Module):
         anyup_q_chunk_size: int = 256,
         local_backbone: str = "resnet18",
         head_type: str = "pointwise",
+        dino_model_name: str = "dinov2_vits14_reg",
         dino_layers: Union[str, Sequence[int], None] = "last",
         use_tile_cls_head: bool = False,
         use_zoom_cls_head: bool = False,
@@ -196,6 +197,7 @@ class Stage1SegNet(nn.Module):
         self.dino_upsampler_type = dino_upsampler_type
         self.local_backbone = str(local_backbone).strip().lower()
         self.head_type = head_type
+        self.dino_model_name = str(dino_model_name)
         self.dino_layers = dino_layers
         self.use_tile_cls_head = bool(use_tile_cls_head)
         self.use_zoom_cls_head = bool(use_zoom_cls_head)
@@ -203,11 +205,11 @@ class Stage1SegNet(nn.Module):
         # for 256k inputs we get token grids of 16k (power-of-two).
         self.dino_input_scale = 14.0 / 16.0
 
-        dino_layer_indices = parse_dino_layers_spec(dino_layers, depth=12)
         self.dino = FrozenDinoTokenBranch(
             channels,
             trust_repo=trust_repo,
-            layer_indices=dino_layer_indices,
+            model_name=self.dino_model_name,
+            layer_spec=dino_layers,
         )
         if self.dino_upsampler_type == "pixelshuffle":
             self.dino_up = DinoPixelShuffleUpsampler(channels)
@@ -235,7 +237,12 @@ class Stage1SegNet(nn.Module):
         else:
             self.local = ResNetLocalBranch(backbone=self.local_backbone, out_channels=channels)
             self.fuse_1x1 = nn.Conv2d(channels + int(self.local.out_channels), channels, kernel_size=1)
-            self.head = SegmentationHead(channels)
+            if self.head_type == "pointwise":
+                self.head = SegmentationHead(channels)
+            elif self.head_type == "dwsep":
+                self.head = AnyUpDwSepSegHead(channels)
+            else:
+                self.head = AnyUpResidualPointwiseSegHead(channels)
             self.anyup_head = None
             self.tile_cls_head = TileClassifierHead(channels) if self.use_tile_cls_head else None
             self.zoom_cls_head = ZoomRoiClassifierHead(channels) if self.use_zoom_cls_head else None

@@ -184,9 +184,10 @@ def make_app() -> gr.Blocks:
                         build_single_image_tab(nested=True)
                     with gr.Tab("Dataset Peek"):
                         build_dataset_peek_tab(ROOT, nested=True)
+                    with gr.Tab("Video -> Frames"):
+                        build_video_frames_tab(ROOT, nested=True)
             build_embedding_bank_tab(ROOT)
             build_object_umap_tab(ROOT)
-            build_video_frames_tab(ROOT)
             build_media_source_tab(ROOT)
             build_live_screen_tab(ROOT)
 

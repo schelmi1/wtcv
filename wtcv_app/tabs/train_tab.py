@@ -24,12 +24,17 @@ def run_train(
     batch_size: int,
     num_workers: int,
     dino_upsampler: str,
+    dino_model: str,
     dino_layers: str,
     anyup_q_chunk_size: int,
     local_backbone: str,
     local_unfreeze: str,
     head_type: str,
+    head_warmup_epoch: int,
+    fuser_unfreeze_epoch: int,
+    dinoup_unfreeze_epoch: int,
     use_tile_cls_head: bool,
+    use_zoom_cls_head: bool,
     tile_cls_weight: float,
     balance_train_50_50: bool,
     balance_val_50_50: bool,
@@ -60,6 +65,7 @@ def run_train(
     trust_torch_hub_repo: bool,
 ) -> Generator[Tuple[str, str], None, None]:
     use_tile_cls_head = as_bool(use_tile_cls_head)
+    use_zoom_cls_head = as_bool(use_zoom_cls_head)
     balance_train_50_50 = as_bool(balance_train_50_50)
     balance_val_50_50 = as_bool(balance_val_50_50)
     augment_low_vis = as_bool(augment_low_vis)
@@ -94,6 +100,8 @@ def run_train(
         str(int(num_workers)),
         "--dino-upsampler",
         dino_upsampler,
+        "--dino-model",
+        str(dino_model),
         "--dino-layers",
         str(dino_layers),
         "--anyup-q-chunk-size",
@@ -104,6 +112,12 @@ def run_train(
         str(local_unfreeze),
         "--head-type",
         head_type,
+        "--head-warmup-epoch",
+        str(int(head_warmup_epoch)),
+        "--fuser-unfreeze-epoch",
+        str(int(fuser_unfreeze_epoch)),
+        "--dinoup-unfreeze-epoch",
+        str(int(dinoup_unfreeze_epoch)),
         "--tile-cls-weight",
         str(float(tile_cls_weight)),
         "--hnm-hard-ratio",
@@ -155,6 +169,7 @@ def run_train(
         cmd += ["--resume-checkpoint", resume_checkpoint.strip()]
 
     cmd += build_bool_arg("--use-tile-cls-head", "--no-use-tile-cls-head", bool(use_tile_cls_head))
+    cmd += build_bool_arg("--use-zoom-cls-head", "--no-use-zoom-cls-head", bool(use_zoom_cls_head))
     cmd += build_bool_arg("--balance-train-50-50", "--no-balance-train-50-50", bool(balance_train_50_50))
     cmd += build_bool_arg("--balance-val-50-50", "--no-balance-val-50-50", bool(balance_val_50_50))
     if augment_low_vis:
@@ -196,14 +211,19 @@ def build_tab(root: Path) -> None:
             lr_scheduler = gr.Dropdown(choices=["none", "cosine"], value="cosine", label="LR Scheduler", info="Learning-rate scheduling strategy used during training.")
         with gr.Row():
             dino_upsampler = gr.Dropdown(choices=["learned", "pixelshuffle", "anyup"], value="learned", label="DINO Upsampler", info="Upsampling head used to project DINO tokens to dense feature maps.")
+            dino_model = gr.Textbox(value="dinov2_vits14_reg", label="DINO Model", info="torch.hub model id, e.g. dinov2_vits14_reg, dinov2_vitb14_reg, dinov2_vitl14_reg.")
             dino_layers = gr.Textbox(value="last", label="DINO Layers (last or 1-based csv)", info="DINO transformer layers to use (\"last\" or comma-separated 1-based indices).")
             anyup_q_chunk_size = gr.Number(value=256, precision=0, label="AnyUp q_chunk_size", info="Chunk size used by AnyUp attention upsampler to limit memory.")
             local_backbone = gr.Dropdown(choices=["resnet18", "resnet34", "resnet50"], value="resnet18", label="Local ResNet Backbone", info="Select local CNN backbone used before fusion. ResNet50 has higher capacity and more channels.")
             local_unfreeze = gr.Dropdown(choices=["none", "l1", "stem+1"], value="none", label="Local ResNet Unfreeze", info="Unfreeze local ResNet blocks: none (frozen), l1 (layer1 only), stem+1 (stem and layer1).")
             head_type = gr.Dropdown(choices=["pointwise", "dwsep", "residual"], value="pointwise", label="Head Type", info="Segmentation decoder head architecture variant.")
+            head_warmup_epoch = gr.Number(value=1, precision=0, label="Head Warmup Epoch", info="Epoch to start training heads.")
+            fuser_unfreeze_epoch = gr.Number(value=2, precision=0, label="Fuser Unfreeze Epoch", info="Epoch to unfreeze fuse_1x1.")
+            dinoup_unfreeze_epoch = gr.Number(value=3, precision=0, label="DinoUp Unfreeze Epoch", info="Epoch to unfreeze dino_up (and scheduled local branch).")
             weight_decay = gr.Number(value=1e-4, label="Weight Decay", info="L2-style regularization strength in the optimizer.")
         with gr.Row():
             use_tile_cls_head = gr.Dropdown(choices=["on", "off"], value="on", label="Use Tile Cls Head", info="Enable auxiliary tile-level classification head during training.")
+            use_zoom_cls_head = gr.Dropdown(choices=["on", "off"], value="on", label="Use Zoom Cls Head", info="Enable auxiliary zoom-region classification head during training.")
             balance_train_50_50 = gr.Dropdown(choices=["on", "off"], value="on", label="Balance Train 50/50", info="Balance train sampling between positive and negative tiles.")
             balance_val_50_50 = gr.Dropdown(choices=["on", "off"], value="on", label="Balance Val 50/50", info="Balance validation sampling between positive and negative tiles.")
             augment_low_vis = gr.Dropdown(choices=["on", "off"], value="off", label="Low-Vis Augment", info="Enable low-visibility image augmentations during training.")
@@ -270,12 +290,17 @@ def build_tab(root: Path) -> None:
                 batch_size,
                 num_workers,
                 dino_upsampler,
+                dino_model,
                 dino_layers,
                 anyup_q_chunk_size,
                 local_backbone,
                 local_unfreeze,
                 head_type,
+                head_warmup_epoch,
+                fuser_unfreeze_epoch,
+                dinoup_unfreeze_epoch,
                 use_tile_cls_head,
+                use_zoom_cls_head,
                 tile_cls_weight,
                 balance_train_50_50,
                 balance_val_50_50,

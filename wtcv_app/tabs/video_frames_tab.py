@@ -40,18 +40,25 @@ def run_extract_frames(
     yield from stream_command(cmd)
 
 
-def build_tab(root: Path) -> None:
+def build_content(root: Path) -> None:
+    with gr.Row():
+        vid_path = gr.Textbox(value="", label="Video Path", info="Path to the source video file passed to ffmpeg.")
+        vid_out = gr.Textbox(value=str(root / "videos/frames_2fps"), label="Output Frames Dir", info="Directory where extracted frame images are written.")
+        vid_fps = gr.Number(value=2.0, label="FPS", info="Target frame extraction rate (frames per second).")
+        vid_overwrite = gr.Dropdown(choices=["on", "off"], value="off", label="Overwrite Existing Frames", info="If on, existing files in the output frames directory can be replaced.")
+    vid_btn = gr.Button("Extract Frames", variant="primary")
+    vid_cmd = gr.Textbox(label="Command", interactive=False)
+    vid_logs = gr.Textbox(label="Live Logs", lines=20, elem_classes=["mono"], interactive=False)
+    vid_btn.click(
+        fn=run_extract_frames,
+        inputs=[vid_path, vid_out, vid_fps, vid_overwrite],
+        outputs=[vid_cmd, vid_logs],
+    )
+
+
+def build_tab(root: Path, nested: bool = False) -> None:
+    if nested:
+        build_content(root)
+        return
     with gr.Tab("Video -> Frames"):
-        with gr.Row():
-            vid_path = gr.Textbox(value="", label="Video Path", info="Path to the source video file passed to ffmpeg.")
-            vid_out = gr.Textbox(value=str(root / "videos/frames_2fps"), label="Output Frames Dir", info="Directory where extracted frame images are written.")
-            vid_fps = gr.Number(value=2.0, label="FPS", info="Target frame extraction rate (frames per second).")
-            vid_overwrite = gr.Dropdown(choices=["on", "off"], value="off", label="Overwrite Existing Frames", info="If on, existing files in the output frames directory can be replaced.")
-        vid_btn = gr.Button("Extract Frames", variant="primary")
-        vid_cmd = gr.Textbox(label="Command", interactive=False)
-        vid_logs = gr.Textbox(label="Live Logs", lines=20, elem_classes=["mono"], interactive=False)
-        vid_btn.click(
-            fn=run_extract_frames,
-            inputs=[vid_path, vid_out, vid_fps, vid_overwrite],
-            outputs=[vid_cmd, vid_logs],
-        )
+        build_content(root)
