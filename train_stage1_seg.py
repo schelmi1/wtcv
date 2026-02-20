@@ -214,10 +214,14 @@ def _sanitize_for_json(v):
     return v
 
 
-def write_run_config(path: Path, cfg: Cfg, extra: Optional[Dict] = None) -> None:
-    payload = {k: str(v) if isinstance(v, Path) else v for k, v in asdict(cfg).items()}
-    if extra:
-        payload.update(extra)
+def write_run_config(
+    path: Path,
+    hparams_effective: Dict[str, object],
+    dataset_stats: Optional[Dict] = None,
+) -> None:
+    payload: Dict[str, object] = {"hparams_effective": hparams_effective}
+    if dataset_stats is not None:
+        payload["dataset_stats"] = dataset_stats
     path.write_text(json.dumps(_sanitize_for_json(payload), indent=2))
 
 
@@ -1491,7 +1495,7 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    write_run_config(run_dir / "config.json", cfg, extra={"hparams_effective": build_effective_hparams(cfg)})
+    write_run_config(run_dir / "config.json", hparams_effective=build_effective_hparams(cfg))
     write_hparams_yaml(run_dir / "hparams.yaml", cfg)
 
     writer = SummaryWriter(log_dir=str(run_dir))
@@ -1773,11 +1777,8 @@ def main() -> None:
     }
     write_run_config(
         run_dir / "config.json",
-        cfg,
-        extra={
-            "hparams_effective": build_effective_hparams(cfg),
-            "dataset_stats": dataset_stats,
-        },
+        hparams_effective=build_effective_hparams(cfg),
+        dataset_stats=dataset_stats,
     )
     if len(getattr(train_ds, "pos_dataset_indices", [])) == 0:
         found = discover_labels(cfg.data_dir)

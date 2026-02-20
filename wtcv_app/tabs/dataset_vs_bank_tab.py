@@ -27,6 +27,7 @@ def run_dataset_vs_bank(
     adapter_input_size: int,
     positive_labels: str,
     bank_topk: int,
+    use_faiss: bool,
     accept_score: float,
     dedup_iou: float,
     vehicle_label: str,
@@ -36,6 +37,7 @@ def run_dataset_vs_bank(
 ) -> Generator[Tuple[str, str], None, None]:
     use_tile_cls_gating = as_bool(use_tile_cls_gating)
     use_amp = as_bool(use_amp)
+    use_faiss = as_bool(use_faiss)
     trust_torch_hub_repo = as_bool(trust_torch_hub_repo)
     cmd = [
         sys.executable,
@@ -79,6 +81,7 @@ def run_dataset_vs_bank(
         "--device",
         str(device),
     ]
+    cmd += build_bool_arg("--use-faiss", "--no-use-faiss", bool(use_faiss))
     ckpt = str(checkpoint).strip()
     if ckpt != "":
         cmd += ["--checkpoint", ckpt]
@@ -144,6 +147,12 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 info="Comma-separated bank labels used as positive reference.",
             )
             dvb_topk = gr.Number(value=5, precision=0, label="Bank Top-K", info="Top-K cosine neighbors for scoring.")
+            dvb_use_faiss = gr.Dropdown(
+                choices=["on", "off"],
+                value="off",
+                label="Use FAISS",
+                info="Use FAISS IndexFlatIP for nearest-neighbor scoring against the positive bank.",
+            )
             dvb_accept = gr.Number(value=0.35, label="Accept Score", info="Add candidate when pos_topk_mean >= this value.")
             dvb_dedup_iou = gr.Number(value=0.30, label="Dedup IoU", info="Skip candidate if IoU with existing positive >= this value.")
             dvb_vehicle_label = gr.Textbox(value="vehicle", label="Added Label Name", info="Label assigned to accepted added candidates.")
@@ -198,6 +207,7 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 dvb_adapter_input_size,
                 dvb_pos_labels,
                 dvb_topk,
+                dvb_use_faiss,
                 dvb_accept,
                 dvb_dedup_iou,
                 dvb_vehicle_label,

@@ -86,6 +86,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--positive-labels", type=str, default="vehicle", help="Comma labels from bank for positive subset")
     ap.add_argument("--negative-labels", type=str, default="fp", help="Unused in additive-positive mode (kept for CLI compatibility)")
     ap.add_argument("--bank-topk", type=int, default=5)
+    ap.add_argument(
+        "--use-faiss",
+        action="store_true",
+        default=False,
+        help="Use FAISS IndexFlatIP for top-k similarity search against positive bank (default: off).",
+    )
+    ap.add_argument("--no-use-faiss", action="store_false", dest="use_faiss")
     ap.add_argument("--neg-weight", type=float, default=1.0, help="Unused in additive-positive mode (kept for CLI compatibility)")
     ap.add_argument("--accept-score", type=float, default=0.35, help="Positive add threshold on pos_topk_mean")
     ap.add_argument("--fp-score", type=float, default=0.40, help="Unused in additive-positive mode (kept for CLI compatibility)")
@@ -350,6 +357,36 @@ def _topk_scores(query: np.ndarray, bank: np.ndarray, k: int) -> Tuple[float, fl
     return float(np.mean(topk)), float(np.max(topk))
 
 
+def _build_faiss_index_ip(bank: np.ndarray):
+    try:
+        import faiss  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "FAISS requested with --use-faiss but import failed. "
+            "Install with `pip install faiss-cpu` (or faiss-gpu where supported)."
+        ) from e
+    if bank.ndim != 2 or int(bank.shape[0]) <= 0 or int(bank.shape[1]) <= 0:
+        raise RuntimeError(f"Invalid bank shape for FAISS: {tuple(bank.shape)}")
+    d = int(bank.shape[1])
+    index = faiss.IndexFlatIP(d)
+    bank_c = np.ascontiguousarray(bank.astype(np.float32))
+    index.add(bank_c)
+    return index
+
+
+def _topk_scores_faiss(query: np.ndarray, faiss_index, k: int) -> Tuple[float, float]:
+    ntotal = int(faiss_index.ntotal)
+    if ntotal <= 0:
+        return float("nan"), float("nan")
+    qq = np.ascontiguousarray(query.astype(np.float32).reshape(1, -1))
+    kk = max(1, min(int(k), ntotal))
+    sims, _idx = faiss_index.search(qq, kk)
+    if sims.size == 0:
+        return float("nan"), float("nan")
+    topk = sims[0]
+    return float(np.mean(topk)), float(np.max(topk))
+
+
 def _mask_stats_for_poly(prob_full: np.ndarray, poly: List[List[float]]) -> Tuple[float, float, int]:
     h, w = prob_full.shape[:2]
     m = np.zeros((h, w), dtype=np.uint8)
@@ -423,6 +460,9 @@ def main() -> None:
     )
     if pos_bank.shape[0] <= 0:
         raise RuntimeError("Positive embedding-bank subset is empty. Check --positive-labels or bank content.")
+    faiss_index = None
+    if bool(args.use_faiss):
+        faiss_index = _build_faiss_index_ip(pos_bank)
 
     device = torch.device(args.device.strip() if args.device.strip() else ("cuda" if torch.cuda.is_available() else "cpu"))
     images = _discover_images(args.input_dir, max_images=int(args.max_images))
@@ -495,6 +535,9 @@ def main() -> None:
         print(f"adapter_input_size={args.adapter_input_size}")
     print(f"input_images={len(images)}")
     print(f"bank_total={bank_info['num_total']} bank_pos={bank_info['num_pos']} bank_neg={bank_info['num_neg']} (neg currently unused)")
+    print(f"use_faiss={bool(args.use_faiss)}")
+    if faiss_index is not None:
+        print(f"faiss_index=IndexFlatIP dim={int(pos_bank.shape[1])} ntotal={int(faiss_index.ntotal)}")
     print(f"det_tile={args.tile_size}/{args.tile_stride} obj_tile={obj_tile_size} obj_context={obj_context_scale}")
     print(f"use_tile_cls_gating={args.use_tile_cls_gating} tile_cls_threshold={args.tile_cls_threshold} mode={args.tile_cls_mode}")
     added_label = str(args.vehicle_label).strip()
@@ -609,7 +652,10 @@ def main() -> None:
                             f"Embedding dim mismatch: query={int(e.shape[0])} bank={int(pos_bank.shape[1])}. "
                             "Use a bank built with the same feature backend/checkpoint."
                         )
-                    pos_mean, pos_max = _topk_scores(e, pos_bank, int(args.bank_topk))
+                    if faiss_index is not None:
+                        pos_mean, pos_max = _topk_scores_faiss(e, faiss_index, int(args.bank_topk))
+                    else:
+                        pos_mean, pos_max = _topk_scores(e, pos_bank, int(args.bank_topk))
                     if (not math.isnan(pos_mean)) and float(pos_mean) >= float(args.accept_score):
                         dup = False
                         for ep in accepted_polys:
@@ -696,6 +742,7 @@ def main() -> None:
         "adapter_input_size": int(args.adapter_input_size),
         "obj_tile_size": int(obj_tile_size),
         "obj_context_scale": float(obj_context_scale),
+        "use_faiss": bool(args.use_faiss),
         "accept_score": float(args.accept_score),
         "dedup_iou": float(args.dedup_iou),
         "vehicle_label": str(args.vehicle_label),
