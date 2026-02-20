@@ -547,7 +547,9 @@ Purpose:
 
 Current strategy:
 1. Load existing image/json pair (or create empty LabelMe json if missing).
-2. Run tiled inference and polygon extraction.
+2. Candidate generation:
+   - with `--checkpoint`: run tiled inference + polygon extraction.
+   - without `--checkpoint`: use existing non-positive LabelMe shapes as candidates.
 3. Embed each predicted polygon (backend selectable):
    - `--feature-backend auto|dino|adapter`
    - `auto` resolves from embedding-bank manifest config.
@@ -573,6 +575,9 @@ python score_dataset_with_embedding_bank.py \
 ```
 
 Key args:
+- `--checkpoint` (optional)
+  - if provided: enables detector inference and adapter feature mode.
+  - if omitted: script forces vanilla DINO embedding mode and scores existing LabelMe candidates.
 - `--feature-backend {auto,dino,adapter}`
   - `adapter` uses the same `--checkpoint` as adapter source.
   - no separate adapter checkpoint in this workflow.

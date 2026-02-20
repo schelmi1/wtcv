@@ -35,7 +35,12 @@ def parse_args() -> argparse.Namespace:
         description="Run model detections over a dataset, score each detection with embedding-bank similarity, and export LabelMe candidates"
     )
     ap.add_argument("--input-dir", type=Path, required=True, help="Folder containing images")
-    ap.add_argument("--checkpoint", type=Path, required=True, help="Stage1 model checkpoint (.pt)")
+    ap.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Optional Stage1 model checkpoint (.pt). If omitted, falls back to vanilla DINO scoring mode.",
+    )
     ap.add_argument("--embedding-bank", type=Path, required=True, help="Path to embedding_bank.npz")
     ap.add_argument("--output-dir", type=Path, default=Path("outputs/dataset_vs_embedding_bank"))
 
@@ -388,10 +393,17 @@ def main() -> None:
     args = parse_args()
     if not args.input_dir.exists():
         raise FileNotFoundError(f"Missing input dir: {args.input_dir}")
-    if not args.checkpoint.exists():
-        raise FileNotFoundError(f"Missing checkpoint: {args.checkpoint}")
     if not args.embedding_bank.exists():
         raise FileNotFoundError(f"Missing embedding bank: {args.embedding_bank}")
+
+    checkpoint: Path | None = None
+    if args.checkpoint is not None:
+        ckpt_str = str(args.checkpoint).strip()
+        # Handles UI-provided empty string -> Path(".") edge-case.
+        if ckpt_str not in {"", "."}:
+            checkpoint = Path(args.checkpoint)
+            if (not checkpoint.exists()) or (not checkpoint.is_file()):
+                raise FileNotFoundError(f"Missing checkpoint file: {checkpoint}")
 
     manifest = _load_bank_manifest_defaults(args.embedding_bank)
     cfg_m = manifest.get("config", {}) if isinstance(manifest, dict) else {}
@@ -423,6 +435,12 @@ def main() -> None:
         feature_backend = fb_m if fb_m in {"dino", "adapter"} else "dino"
         print(f"feature_backend_auto_resolved={feature_backend}")
 
+    if checkpoint is None:
+        # No adapter checkpoint available: force vanilla DINO embedding path.
+        if feature_backend != "dino":
+            print("note: no checkpoint specified; forcing feature_backend=dino")
+        feature_backend = "dino"
+
     if feature_backend == "dino":
         if int(obj_tile_size) % 14 != 0:
             raise ValueError(
@@ -439,7 +457,12 @@ def main() -> None:
     out_labelme.mkdir(parents=True, exist_ok=True)
     out_report = out / "detections_scored.jsonl"
 
-    model, info = load_model(args.checkpoint, device)
+    model = None
+    info: Dict = {}
+    if checkpoint is not None:
+        model, info = load_model(checkpoint, device)
+    else:
+        print("note: running without checkpoint; using existing LabelMe shapes as candidates")
     dino = None
     embed_model = None
     if feature_backend == "dino":
@@ -447,6 +470,8 @@ def main() -> None:
         for p in dino.parameters():
             p.requires_grad = False
     else:
+        if model is None:
+            raise RuntimeError("Adapter backend requires a checkpoint model.")
         embed_model = model
         print("adapter_embedding_model_checkpoint=<checkpoint>")
         if int(args.adapter_input_size) <= 0:
@@ -461,7 +486,7 @@ def main() -> None:
                 )
 
     print(f"device={device}")
-    print(f"checkpoint={args.checkpoint}")
+    print(f"checkpoint={checkpoint if checkpoint is not None else 'None'}")
     print(f"feature_backend={feature_backend}")
     if feature_backend == "dino":
         print(f"dino_model={dino_model_name}")
@@ -479,7 +504,7 @@ def main() -> None:
         added_label = f"{added_label}_auto"
 
     print(f"accept_score={args.accept_score} dedup_iou={args.dedup_iou} vehicle_label={args.vehicle_label} added_label={added_label}")
-    print(f"model_info={info}")
+    print(f"model_info={info if checkpoint is not None else 'N/A (no checkpoint mode)'}")
     print("strategy=keep original labels, add positive candidates only")
 
     total_polys = 0
@@ -505,25 +530,46 @@ def main() -> None:
                     continue
                 existing_pos_polys.append(pts)
 
-            prob_lr, _cls_lr, stats = infer_prob_map(
-                model=model,
-                image_np=image_rgb,
-                tile_size=int(args.tile_size),
-                stride=int(args.tile_stride),
-                seg_out_stride=int(args.seg_out_stride),
-                device=device,
-                use_tile_cls_gating=bool(args.use_tile_cls_gating),
-                tile_cls_threshold=float(args.tile_cls_threshold),
-                tile_cls_mode=str(args.tile_cls_mode),
-            )
-            prob_full = F.interpolate(
-                torch.from_numpy(prob_lr).float().unsqueeze(0).unsqueeze(0),
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            )[0, 0].numpy()
-            pred_mask = (prob_full >= float(args.pred_threshold)).astype(np.uint8)
-            polys = mask_to_polygons(pred_mask, min_area=float(args.min_poly_area), epsilon_frac=float(args.poly_epsilon_frac))
+            stats = {
+                "tile_cls_used": float("nan"),
+                "tile_cls_mean": float("nan"),
+            }
+            if checkpoint is not None:
+                prob_lr, _cls_lr, stats = infer_prob_map(
+                    model=model,
+                    image_np=image_rgb,
+                    tile_size=int(args.tile_size),
+                    stride=int(args.tile_stride),
+                    seg_out_stride=int(args.seg_out_stride),
+                    device=device,
+                    use_tile_cls_gating=bool(args.use_tile_cls_gating),
+                    tile_cls_threshold=float(args.tile_cls_threshold),
+                    tile_cls_mode=str(args.tile_cls_mode),
+                )
+                prob_full = F.interpolate(
+                    torch.from_numpy(prob_lr).float().unsqueeze(0).unsqueeze(0),
+                    size=(h, w),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0].numpy()
+                pred_mask = (prob_full >= float(args.pred_threshold)).astype(np.uint8)
+                polys = mask_to_polygons(
+                    pred_mask,
+                    min_area=float(args.min_poly_area),
+                    epsilon_frac=float(args.poly_epsilon_frac),
+                )
+            else:
+                # No detector checkpoint: score existing non-positive shapes as candidates.
+                prob_full = np.zeros((h, w), dtype=np.float32)
+                polys = []
+                for s in src_shapes:
+                    lab = str(s.get("label", "")).strip().casefold()
+                    if lab in pos_label_set:
+                        continue
+                    pts = shape_to_points(s, min_poly_points=3)
+                    if pts is None:
+                        continue
+                    polys.append(pts)
             if feature_backend == "dino":
                 emb_list = _embed_polygons_dino(
                     image_rgb=image_rgb,

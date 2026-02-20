@@ -42,8 +42,6 @@ def run_dataset_vs_bank(
         str(ROOT / "score_dataset_with_embedding_bank.py"),
         "--input-dir",
         input_dir,
-        "--checkpoint",
-        checkpoint,
         "--embedding-bank",
         embedding_bank,
         "--output-dir",
@@ -81,6 +79,9 @@ def run_dataset_vs_bank(
         "--device",
         str(device),
     ]
+    ckpt = str(checkpoint).strip()
+    if ckpt != "":
+        cmd += ["--checkpoint", ckpt]
     cmd += build_bool_arg("--use-tile-cls-gating", "--no-use-tile-cls-gating", bool(use_tile_cls_gating))
     if bool(use_amp):
         cmd += ["--use-amp"]
@@ -105,7 +106,7 @@ def build_tab(root: Path, nested: bool = False) -> None:
             dvb_ckpt = gr.Textbox(
                 value="",
                 label="Checkpoint",
-                info="Model checkpoint used for tiled inference.",
+                info="Optional model checkpoint. If blank, runs in no-checkpoint mode with vanilla DINO scoring on existing LabelMe shapes.",
             )
             dvb_bank = gr.Textbox(
                 value=str(root / "outputs/embedding_bank/embedding_bank.npz"),
