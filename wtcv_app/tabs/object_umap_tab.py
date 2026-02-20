@@ -18,10 +18,15 @@ def run_object_umap(
     tile_size: int,
     tile_context_scale: float,
     batch_size: int,
+    feature_backend: str,
+    adapter_checkpoint: str,
+    adapter_feature_key: str,
+    adapter_input_size: int,
     device: str,
     umap_n_neighbors: int,
     umap_min_dist: float,
     umap_metric: str,
+    run_kmeans: bool,
     num_clusters: int,
     seed: int,
     overwrite_dataset: bool,
@@ -51,6 +56,12 @@ def run_object_umap(
         str(float(tile_context_scale)),
         "--batch-size",
         str(int(batch_size)),
+        "--feature-backend",
+        str(feature_backend),
+        "--adapter-feature-key",
+        str(adapter_feature_key),
+        "--adapter-input-size",
+        str(int(adapter_input_size)),
         "--device",
         str(device),
         "--umap-n-neighbors",
@@ -64,6 +75,10 @@ def run_object_umap(
         "--seed",
         str(int(seed)),
     ]
+    cmd += build_bool_arg("--run-kmeans", "--no-run-kmeans", bool(as_bool(run_kmeans)))
+    adapter_checkpoint = str(adapter_checkpoint).strip()
+    if adapter_checkpoint:
+        cmd += ["--adapter-checkpoint", adapter_checkpoint]
     cmd += build_bool_arg("--overwrite-dataset", "--no-overwrite-dataset", bool(overwrite_dataset))
     cmd += build_bool_arg("--trust-torch-hub-repo", "--no-trust-torch-hub-repo", bool(trust_torch_hub_repo))
     if launch:
@@ -108,11 +123,41 @@ def build_tab(root: Path) -> None:
             fo_context = gr.Number(value=2.0, label="Tile Context Scale", info="Object crop context multiplier relative to object bbox size.")
             fo_batch = gr.Number(value=12, precision=0, label="DINO Batch Size", info="Batch size used while extracting DINO embeddings.")
         with gr.Row():
+            fo_feature_backend = gr.Dropdown(
+                choices=["auto", "dino", "adapter"],
+                value="auto",
+                label="Feature Backend",
+                info="auto uses adapter only when a checkpoint is provided; otherwise raw DINO.",
+            )
+            fo_adapter_ckpt = gr.Textbox(
+                value="",
+                label="Adapter Checkpoint (optional)",
+                info="If set, Object UMAP can use Stage1 adapter features for masked pooling.",
+            )
+            fo_adapter_feature_key = gr.Dropdown(
+                choices=["feat_adapted", "feat_dino"],
+                value="feat_adapted",
+                label="Adapter Feature Key",
+                info="Feature map key from Stage1 model to pool object embeddings from.",
+            )
+            fo_adapter_input_size = gr.Number(
+                value=0,
+                precision=0,
+                label="Adapter Input Size (0=tile size)",
+                info="Optional square resize before adapter forward. Must be multiple of 256 when > 0.",
+            )
+        with gr.Row():
             fo_device = gr.Textbox(value="", label="Device (blank=auto)", info="Compute device override; leave blank for automatic selection.")
             fo_umap_neighbors = gr.Number(value=30, precision=0, label="UMAP n_neighbors", info="UMAP neighborhood size controlling local/global manifold balance.")
             fo_umap_min_dist = gr.Number(value=0.05, label="UMAP min_dist", info="UMAP minimum embedding distance; lower values produce tighter clusters.")
             fo_umap_metric = gr.Textbox(value="cosine", label="UMAP metric", info="Distance metric used by UMAP for embedding computation.")
         with gr.Row():
+            fo_run_kmeans = gr.Dropdown(
+                choices=["on", "off"],
+                value="off",
+                label="Run KMeans",
+                info="Optional. If off, no cluster fit/labels are created.",
+            )
             fo_clusters = gr.Number(value=20, precision=0, label="KMeans Clusters", info="Number of KMeans clusters in embedding space.")
             fo_seed = gr.Number(value=42, precision=0, label="Seed", info="Random seed for reproducible sampling and clustering behavior.")
             fo_overwrite = gr.Dropdown(choices=["on", "off"], value="on", label="Overwrite Dataset", info="If on, delete and recreate an existing FiftyOne dataset name.")
@@ -132,10 +177,15 @@ def build_tab(root: Path) -> None:
                 fo_tile_size,
                 fo_context,
                 fo_batch,
+                fo_feature_backend,
+                fo_adapter_ckpt,
+                fo_adapter_feature_key,
+                fo_adapter_input_size,
                 fo_device,
                 fo_umap_neighbors,
                 fo_umap_min_dist,
                 fo_umap_metric,
+                fo_run_kmeans,
                 fo_clusters,
                 fo_seed,
                 fo_overwrite,

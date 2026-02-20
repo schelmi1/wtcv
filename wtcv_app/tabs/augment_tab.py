@@ -85,63 +85,70 @@ def run_augment(
     yield from stream_command(cmd)
 
 
-def build_tab(root: Path) -> None:
+def build_content(root: Path) -> None:
+    with gr.Row():
+        aug_target_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Target Dir", info="Target dataset directory whose images will receive pasted objects.")
+        aug_donor_dir = gr.Textbox(value=str(root / "data/sam_box_to_poly"), label="Donor Dir", info="Donor dataset directory used to source polygon objects.")
+        aug_output_dir = gr.Textbox(value=str(root / "data/record_pairs_augmented"), label="Output Dir", info="Directory where generated outputs are written.")
+    with gr.Row():
+        aug_target_label = gr.Textbox(value="vehicle", label="Target Label", info="Label in target dataset used for placement constraints/statistics.")
+        aug_donor_label = gr.Textbox(value="vehicle", label="Donor Label", info="Label class sampled from donor polygons.")
+        aug_seed = gr.Number(value=42, precision=0, label="Seed", info="Random seed for reproducible sampling and clustering behavior.")
+    with gr.Row():
+        aug_min_paste = gr.Number(value=1, precision=0, label="Min Pastes / Image", info="Minimum number of pasted objects per augmented target image.")
+        aug_max_paste = gr.Number(value=3, precision=0, label="Max Pastes / Image", info="Maximum number of pasted objects per augmented target image.")
+        aug_max_images = gr.Number(value=0, precision=0, label="Max Target Images (0=all)", info="Maximum target images to augment; 0 means all.")
+        aug_donor_max_images = gr.Number(value=0, precision=0, label="Donor Max Images (0=all)", info="Maximum donor images to scan; 0 means all.")
+    with gr.Row():
+        aug_horizon = gr.Number(value=0.35, label="Placement Horizon Frac", info="Preferred vertical placement bias as image-height fraction.")
+        aug_tries = gr.Number(value=40, precision=0, label="Max Placement Tries", info="Maximum random placement attempts per paste candidate.")
+        aug_overlap = gr.Number(value=0.15, label="Max Overlap IoU", info="Maximum allowed IoU overlap between pasted and existing objects.")
+        aug_size_min = gr.Number(value=0.0001, label="Size Min Ratio", info="Minimum pasted object area ratio relative to target image area.")
+        aug_size_max = gr.Number(value=0.05, label="Size Max Ratio", info="Maximum pasted object area ratio relative to target image area.")
+    with gr.Row():
+        aug_min_poly = gr.Number(value=12.0, label="Min Poly Area", info="Minimum polygon area kept during mask-to-polygon conversion.")
+        aug_poly_eps = gr.Number(value=0.0, label="Poly Epsilon Frac (0=raw contour)", info="Contour simplification factor; 0 keeps raw contour points.")
+        aug_feather = gr.Number(value=3, precision=0, label="Feather Radius", info="Alpha feather radius in pixels for smoother paste blending.")
+        aug_jpeg_min = gr.Number(value=55, precision=0, label="JPEG Q Min", info="Minimum JPEG recompression quality used for appearance perturbation.")
+        aug_jpeg_max = gr.Number(value=92, precision=0, label="JPEG Q Max", info="Maximum JPEG recompression quality used for appearance perturbation.")
+        aug_occ = gr.Number(value=0.45, label="Occlusion Prob", info="Probability of applying synthetic occlusion to pasted objects.")
+        aug_overwrite = gr.Dropdown(choices=["on", "off"], value="off", label="Overwrite Output", info="If on, existing output files/directories may be replaced.")
+    aug_btn = gr.Button("Run Augmentation", variant="primary")
+    aug_cmd = gr.Textbox(label="Command", interactive=False)
+    aug_logs = gr.Textbox(label="Live Logs", lines=24, elem_classes=["mono"], interactive=False)
+    aug_btn.click(
+        fn=run_augment,
+        inputs=[
+            aug_target_dir,
+            aug_donor_dir,
+            aug_output_dir,
+            aug_target_label,
+            aug_donor_label,
+            aug_seed,
+            aug_min_paste,
+            aug_max_paste,
+            aug_max_images,
+            aug_donor_max_images,
+            aug_horizon,
+            aug_tries,
+            aug_overlap,
+            aug_size_min,
+            aug_size_max,
+            aug_min_poly,
+            aug_poly_eps,
+            aug_feather,
+            aug_jpeg_min,
+            aug_jpeg_max,
+            aug_occ,
+            aug_overwrite,
+        ],
+        outputs=[aug_cmd, aug_logs],
+    )
+
+
+def build_tab(root: Path, nested: bool = False) -> None:
+    if nested:
+        build_content(root)
+        return
     with gr.Tab("Augment"):
-        with gr.Row():
-            aug_target_dir = gr.Textbox(value=str(root / "data/record_pairs"), label="Target Dir", info="Target dataset directory whose images will receive pasted objects.")
-            aug_donor_dir = gr.Textbox(value=str(root / "data/sam_box_to_poly"), label="Donor Dir", info="Donor dataset directory used to source polygon objects.")
-            aug_output_dir = gr.Textbox(value=str(root / "data/record_pairs_augmented"), label="Output Dir", info="Directory where generated outputs are written.")
-        with gr.Row():
-            aug_target_label = gr.Textbox(value="vehicle", label="Target Label", info="Label in target dataset used for placement constraints/statistics.")
-            aug_donor_label = gr.Textbox(value="vehicle", label="Donor Label", info="Label class sampled from donor polygons.")
-            aug_seed = gr.Number(value=42, precision=0, label="Seed", info="Random seed for reproducible sampling and clustering behavior.")
-        with gr.Row():
-            aug_min_paste = gr.Number(value=1, precision=0, label="Min Pastes / Image", info="Minimum number of pasted objects per augmented target image.")
-            aug_max_paste = gr.Number(value=3, precision=0, label="Max Pastes / Image", info="Maximum number of pasted objects per augmented target image.")
-            aug_max_images = gr.Number(value=0, precision=0, label="Max Target Images (0=all)", info="Maximum target images to augment; 0 means all.")
-            aug_donor_max_images = gr.Number(value=0, precision=0, label="Donor Max Images (0=all)", info="Maximum donor images to scan; 0 means all.")
-        with gr.Row():
-            aug_horizon = gr.Number(value=0.35, label="Placement Horizon Frac", info="Preferred vertical placement bias as image-height fraction.")
-            aug_tries = gr.Number(value=40, precision=0, label="Max Placement Tries", info="Maximum random placement attempts per paste candidate.")
-            aug_overlap = gr.Number(value=0.15, label="Max Overlap IoU", info="Maximum allowed IoU overlap between pasted and existing objects.")
-            aug_size_min = gr.Number(value=0.0001, label="Size Min Ratio", info="Minimum pasted object area ratio relative to target image area.")
-            aug_size_max = gr.Number(value=0.05, label="Size Max Ratio", info="Maximum pasted object area ratio relative to target image area.")
-        with gr.Row():
-            aug_min_poly = gr.Number(value=12.0, label="Min Poly Area", info="Minimum polygon area kept during mask-to-polygon conversion.")
-            aug_poly_eps = gr.Number(value=0.0, label="Poly Epsilon Frac (0=raw contour)", info="Contour simplification factor; 0 keeps raw contour points.")
-            aug_feather = gr.Number(value=3, precision=0, label="Feather Radius", info="Alpha feather radius in pixels for smoother paste blending.")
-            aug_jpeg_min = gr.Number(value=55, precision=0, label="JPEG Q Min", info="Minimum JPEG recompression quality used for appearance perturbation.")
-            aug_jpeg_max = gr.Number(value=92, precision=0, label="JPEG Q Max", info="Maximum JPEG recompression quality used for appearance perturbation.")
-            aug_occ = gr.Number(value=0.45, label="Occlusion Prob", info="Probability of applying synthetic occlusion to pasted objects.")
-            aug_overwrite = gr.Dropdown(choices=["on", "off"], value="off", label="Overwrite Output", info="If on, existing output files/directories may be replaced.")
-        aug_btn = gr.Button("Run Augmentation", variant="primary")
-        aug_cmd = gr.Textbox(label="Command", interactive=False)
-        aug_logs = gr.Textbox(label="Live Logs", lines=24, elem_classes=["mono"], interactive=False)
-        aug_btn.click(
-            fn=run_augment,
-            inputs=[
-                aug_target_dir,
-                aug_donor_dir,
-                aug_output_dir,
-                aug_target_label,
-                aug_donor_label,
-                aug_seed,
-                aug_min_paste,
-                aug_max_paste,
-                aug_max_images,
-                aug_donor_max_images,
-                aug_horizon,
-                aug_tries,
-                aug_overlap,
-                aug_size_min,
-                aug_size_max,
-                aug_min_poly,
-                aug_poly_eps,
-                aug_feather,
-                aug_jpeg_min,
-                aug_jpeg_max,
-                aug_occ,
-                aug_overwrite,
-            ],
-            outputs=[aug_cmd, aug_logs],
-        )
+        build_content(root)

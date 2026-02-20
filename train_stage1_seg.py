@@ -127,15 +127,98 @@ def _yaml_scalar(v):
     return str(v)
 
 
-def write_hparams_yaml(path: Path, cfg: Cfg) -> None:
+def build_effective_hparams(cfg: Cfg) -> Dict[str, object]:
     d = asdict(cfg)
+    drop: set[str] = set()
+
+    # Loss-family specific knobs.
+    if str(cfg.segmentation_loss) == "bce_mcc":
+        drop.update(
+            {
+                "focal_weight",
+                "tversky_weight",
+                "focal_alpha",
+                "focal_gamma",
+                "tversky_alpha",
+                "tversky_beta",
+            }
+        )
+    elif str(cfg.segmentation_loss) == "focal_bce_tversky":
+        drop.update({"mcc_weight", "mcc_warmup_epochs"})
+    else:
+        # Unknown mode: keep all to avoid hiding potentially relevant params.
+        pass
+
+    # Strategy-specific knobs.
+    if str(cfg.training_strategy).lower() != "semantic_preserve":
+        drop.update(
+            {
+                "preserve_weight",
+                "preserve_warmup_epochs",
+                "preserve_bg_weight",
+                "preserve_fg_weight",
+                "var_weight",
+                "var_gamma",
+            }
+        )
+
+    # Optional head/loss knobs.
+    if not bool(cfg.use_tile_cls_head):
+        drop.add("tile_cls_weight")
+    if not bool(cfg.use_zoom_cls_head):
+        drop.add("zoom_cls_weight")
+    if not bool(cfg.use_fp_supervision):
+        drop.add("fp_neg_weight")
+
+    # Schedule-specific knobs.
+    if str(cfg.lr_scheduler).lower() == "none":
+        drop.add("lr_min")
+    if not bool(cfg.hard_negative_mining):
+        drop.update({"hnm_hard_ratio", "hnm_pool_frac"})
+
+    # Backend-specific knobs.
+    if str(cfg.dino_upsampler_type) != "anyup":
+        drop.add("anyup_q_chunk_size")
+
+    eff: Dict[str, object] = {}
+    for k, v in d.items():
+        if k in drop:
+            continue
+        if isinstance(v, Path):
+            eff[k] = str(v)
+        else:
+            eff[k] = v
+    return eff
+
+
+def write_hparams_yaml(path: Path, cfg: Cfg) -> None:
+    d = build_effective_hparams(cfg)
     lines = []
     for k in sorted(d.keys()):
         v = d[k]
-        if isinstance(v, Path):
-            v = str(v)
         lines.append(f"{k}: {_yaml_scalar(v)}")
     path.write_text("\n".join(lines) + "\n")
+
+
+def _sanitize_for_json(v):
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, dict):
+        return {str(k): _sanitize_for_json(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_sanitize_for_json(x) for x in v]
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.floating):
+        return float(v)
+    return v
+
+
+def write_run_config(path: Path, cfg: Cfg, extra: Optional[Dict] = None) -> None:
+    payload = {k: str(v) if isinstance(v, Path) else v for k, v in asdict(cfg).items()}
+    if extra:
+        payload.update(extra)
+    path.write_text(json.dumps(_sanitize_for_json(payload), indent=2))
 
 
 def set_seed(seed: int) -> None:
@@ -1408,9 +1491,7 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    (run_dir / "config.json").write_text(
-        json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in asdict(cfg).items()}, indent=2)
-    )
+    write_run_config(run_dir / "config.json", cfg, extra={"hparams_effective": build_effective_hparams(cfg)})
     write_hparams_yaml(run_dir / "hparams.yaml", cfg)
 
     writer = SummaryWriter(log_dir=str(run_dir))
@@ -1592,6 +1673,15 @@ def main() -> None:
         verbose=cfg.dataloader_verbose,
     )
 
+    train_tiles_pre_subset = int(len(train_ds))
+    val_tiles_effective = int(len(val_ds))
+    train_pos_tiles_pre_subset = int(len(getattr(train_ds, "pos_dataset_indices", [])))
+    train_neg_tiles_pre_subset = int(len(getattr(train_ds, "neg_dataset_indices", [])))
+    train_fp_neg_tiles_pre_subset = int(len(getattr(train_ds, "fp_neg_dataset_indices", [])))
+    val_pos_tiles_effective = int(len(getattr(val_ds, "pos_dataset_indices", [])))
+    val_neg_tiles_effective = int(len(getattr(val_ds, "neg_dataset_indices", [])))
+    val_fp_neg_tiles_effective = int(len(getattr(val_ds, "fp_neg_dataset_indices", [])))
+
     # Apply subset at the end: balancing has already been applied in dataset generation.
     if cfg.subset_size > 0:
         n = min(cfg.subset_size, len(train_ds))
@@ -1609,12 +1699,19 @@ def main() -> None:
         subset_note = "using full train set after dataset balancing step"
         train_ds.neg_hard_scores = np.zeros(len(train_ds.samples), dtype=np.float32)
 
-    pos_tiles = len(getattr(train_ds, "pos_dataset_indices", []))
-    neg_tiles = len(getattr(train_ds, "neg_dataset_indices", []))
-    fp_neg_tiles = len(getattr(train_ds, "fp_neg_dataset_indices", []))
+    pos_tiles = int(len(getattr(train_ds, "pos_dataset_indices", [])))
+    neg_tiles = int(len(getattr(train_ds, "neg_dataset_indices", [])))
+    fp_neg_tiles = int(len(getattr(train_ds, "fp_neg_dataset_indices", [])))
     fp_neg_frac = (float(fp_neg_tiles) / float(max(1, neg_tiles))) if neg_tiles > 0 else float("nan")
     train_fp_pool = int(getattr(train_ds, "stats", {}).get("fp_neg_pool", 0))
     train_neg_pool = int(getattr(train_ds, "stats", {}).get("neg_pool", 0))
+    val_fp_pool = int(getattr(val_ds, "stats", {}).get("fp_neg_pool", 0))
+    val_neg_pool = int(getattr(val_ds, "stats", {}).get("neg_pool", 0))
+    val_fp_neg_frac = (
+        float(val_fp_neg_tiles_effective) / float(max(1, val_neg_tiles_effective))
+        if val_neg_tiles_effective > 0
+        else float("nan")
+    )
     print_kv_rows(
         [
             ("subset", subset_note),
@@ -1626,7 +1723,61 @@ def main() -> None:
             ("train_fp_neg_frac_of_neg", f"{fp_neg_frac:.3f}"),
             ("train_neg_pool_pre_balance", train_neg_pool),
             ("train_fp_neg_pool_pre_balance", train_fp_pool),
+            ("val_pos_tiles", val_pos_tiles_effective),
+            ("val_neg_tiles", val_neg_tiles_effective),
+            ("val_fp_neg_tiles", val_fp_neg_tiles_effective),
+            ("val_fp_neg_frac_of_neg", f"{val_fp_neg_frac:.3f}"),
+            ("val_neg_pool_pre_balance", val_neg_pool),
+            ("val_fp_neg_pool_pre_balance", val_fp_pool),
         ]
+    )
+
+    dataset_stats = {
+        "records_loaded": int(len(records)),
+        "records_train": int(len(train_records)),
+        "records_val": int(len(val_records)),
+        "labels_pos_loaded": int(counts_all["pos_labels"]),
+        "labels_neg_loaded": int(counts_all["neg_labels"]),
+        "labels_pos_train": int(train_counts["pos_labels"]),
+        "labels_neg_train": int(train_counts["neg_labels"]),
+        "labels_pos_val": int(val_counts["pos_labels"]),
+        "labels_neg_val": int(val_counts["neg_labels"]),
+        "images_with_pos_labels_loaded": int(counts_all["images_with_pos_labels"]),
+        "images_with_neg_labels_loaded": int(counts_all["images_with_neg_labels"]),
+        "images_with_pos_labels_train": int(train_counts["images_with_pos_labels"]),
+        "images_with_neg_labels_train": int(train_counts["images_with_neg_labels"]),
+        "images_with_pos_labels_val": int(val_counts["images_with_pos_labels"]),
+        "images_with_neg_labels_val": int(val_counts["images_with_neg_labels"]),
+        "tile_configs": tile_configs,
+        "train_tiles_pre_subset": int(train_tiles_pre_subset),
+        "train_pos_tiles_pre_subset": int(train_pos_tiles_pre_subset),
+        "train_neg_tiles_pre_subset": int(train_neg_tiles_pre_subset),
+        "train_fp_neg_tiles_pre_subset": int(train_fp_neg_tiles_pre_subset),
+        "train_tiles_effective": int(len(train_ds)),
+        "train_pos_tiles_effective": int(pos_tiles),
+        "train_neg_tiles_effective": int(neg_tiles),
+        "train_fp_neg_tiles_effective": int(fp_neg_tiles),
+        "train_neg_pool_pre_balance": int(train_neg_pool),
+        "train_fp_neg_pool_pre_balance": int(train_fp_pool),
+        "val_tiles_effective": int(val_tiles_effective),
+        "val_pos_tiles_effective": int(val_pos_tiles_effective),
+        "val_neg_tiles_effective": int(val_neg_tiles_effective),
+        "val_fp_neg_tiles_effective": int(val_fp_neg_tiles_effective),
+        "val_neg_pool_pre_balance": int(val_neg_pool),
+        "val_fp_neg_pool_pre_balance": int(val_fp_pool),
+        "balance_train_50_50": bool(cfg.balance_train_50_50),
+        "balance_val_50_50": bool(cfg.balance_val_50_50),
+        "subset_size_requested": int(cfg.subset_size),
+        "subset_applied": bool(cfg.subset_size > 0),
+        "subset_note": str(subset_note),
+    }
+    write_run_config(
+        run_dir / "config.json",
+        cfg,
+        extra={
+            "hparams_effective": build_effective_hparams(cfg),
+            "dataset_stats": dataset_stats,
+        },
     )
     if len(getattr(train_ds, "pos_dataset_indices", [])) == 0:
         found = discover_labels(cfg.data_dir)

@@ -181,7 +181,12 @@ def make_app() -> gr.Blocks:
                 with gr.Tabs():
                     build_sam_tab(ROOT)
                     build_sam2_tab(ROOT)
-            build_augment_tab(ROOT)
+            with gr.Tab("Tools"):
+                with gr.Tabs():
+                    with gr.Tab("Video -> Frames"):
+                        build_video_frames_tab(ROOT, nested=True)
+                    with gr.Tab("Augment"):
+                        build_augment_tab(ROOT, nested=True)
             with gr.Tab("Data Curation Toolkit"):
                 with gr.Tabs():
                     with gr.Tab("Curation (CV2 UI)"):
@@ -190,8 +195,6 @@ def make_app() -> gr.Blocks:
                         build_single_image_tab(nested=True)
                     with gr.Tab("Dataset Peek"):
                         build_dataset_peek_tab(ROOT, nested=True)
-                    with gr.Tab("Video -> Frames"):
-                        build_video_frames_tab(ROOT, nested=True)
                     with gr.Tab("Dataset vs Bank"):
                         build_dataset_vs_bank_tab(ROOT, nested=True)
             build_embedding_bank_tab(ROOT)

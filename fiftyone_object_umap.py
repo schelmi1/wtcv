@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 import torchvision
 from torchvision.transforms import functional as TF
+from curate_model_predictions_to_labelme import load_model
 
 try:
     import umap  # type: ignore
@@ -71,6 +72,32 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tile-context-scale", type=float, default=2.0, help="Crop side = max(w,h) * scale around object bbox")
     ap.add_argument("--min-poly-points", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=12)
+    ap.add_argument(
+        "--feature-backend",
+        type=str,
+        choices=["auto", "dino", "adapter"],
+        default="auto",
+        help="Feature extractor backend. auto=adapter when checkpoint provided, else dino.",
+    )
+    ap.add_argument(
+        "--adapter-checkpoint",
+        type=str,
+        default="",
+        help="Optional Stage1 checkpoint path. If set (and backend=auto), adapter features are used.",
+    )
+    ap.add_argument(
+        "--adapter-feature-key",
+        type=str,
+        choices=["feat_adapted", "feat_dino"],
+        default="feat_adapted",
+        help="Feature map key from Stage1 model used for masked pooling.",
+    )
+    ap.add_argument(
+        "--adapter-input-size",
+        type=int,
+        default=0,
+        help="Optional square resize before adapter forward (0 keeps tile_size). Must be multiple of 256.",
+    )
 
     ap.add_argument("--dino-model", type=str, default=FIXED_DINO_MODEL)
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
@@ -81,6 +108,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--umap-min-dist", type=float, default=0.05)
     ap.add_argument("--umap-metric", type=str, default="cosine")
     ap.add_argument("--num-clusters", type=int, default=20)
+    ap.add_argument("--run-kmeans", action="store_true", default=False, help="If set, run KMeans and write cluster labels.")
+    ap.add_argument("--no-run-kmeans", action="store_false", dest="run_kmeans")
     ap.add_argument("--seed", type=int, default=42)
 
     ap.add_argument("--overwrite-dataset", action="store_true", default=True)
@@ -222,7 +251,7 @@ def masked_pool_from_tokens(
     return vec
 
 
-def compute_embeddings(
+def compute_embeddings_dino(
     metas: List[ObjMeta],
     dino_model_name: str,
     device: torch.device,
@@ -269,13 +298,77 @@ def compute_embeddings(
     return np.stack(embs, axis=0)
 
 
+def compute_embeddings_adapter(
+    metas: List[ObjMeta],
+    checkpoint: Path,
+    device: torch.device,
+    batch_size: int,
+    feature_key: str,
+    adapter_input_size: int,
+) -> np.ndarray:
+    model, info = load_model(checkpoint=checkpoint, device=device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    print(f"adapter_model_info={info}")
+    print(f"adapter_feature_key={feature_key}")
+    print(f"adapter_input_size={(adapter_input_size if adapter_input_size > 0 else 'tile_size')}")
+
+    embs: List[np.ndarray] = []
+    pending_x: List[torch.Tensor] = []
+    pending_masks: List[np.ndarray] = []
+
+    def flush() -> None:
+        nonlocal pending_x, pending_masks
+        if len(pending_x) == 0:
+            return
+        x = torch.stack(pending_x, dim=0)
+        if int(adapter_input_size) > 0 and int(adapter_input_size) != int(x.shape[-1]):
+            x = F.interpolate(
+                x,
+                size=(int(adapter_input_size), int(adapter_input_size)),
+                mode="bilinear",
+                align_corners=False,
+            )
+        x = x.to(device)
+        with torch.inference_mode():
+            pred = model(x, return_features=True)
+            if feature_key not in pred:
+                raise RuntimeError(
+                    f"Feature key '{feature_key}' not returned by model. "
+                    f"Available keys: {sorted(list(pred.keys()))}"
+                )
+            fmap = pred[feature_key]
+            if fmap.ndim != 4:
+                raise RuntimeError(f"Expected 4D feature map for {feature_key}, got shape={tuple(fmap.shape)}")
+        for i in range(int(fmap.shape[0])):
+            v = masked_pool_from_tokens(fmap[i], pending_masks[i])
+            v = F.normalize(v, dim=0)
+            embs.append(v.detach().cpu().numpy().astype(np.float32))
+        pending_x = []
+        pending_masks = []
+
+    for m in tqdm(metas, desc="adapter masked pool"):
+        x = load_crop_tensor(m.crop_path)
+        mask = polygon_mask(m.crop_points, w=x.shape[-1], h=x.shape[-2])
+        pending_x.append(x)
+        pending_masks.append(mask)
+        if len(pending_x) >= max(1, int(batch_size)):
+            flush()
+    flush()
+
+    if len(embs) == 0:
+        raise RuntimeError("No embeddings computed")
+    return np.stack(embs, axis=0)
+
+
 def add_to_fiftyone(
     dataset_name: str,
     overwrite_dataset: bool,
     metas: List[ObjMeta],
     embeddings: np.ndarray,
     umap_xy: np.ndarray,
-    cluster_ids: np.ndarray,
+    cluster_ids: Optional[np.ndarray],
     launch: bool,
 ) -> fo.Dataset:
     if fo.dataset_exists(dataset_name):
@@ -323,7 +416,8 @@ def add_to_fiftyone(
         s["object_poly"] = fo.Polylines(polylines=[pl])
         s["embedding"] = embeddings[i].astype(np.float32).tolist()
         s["umap"] = umap_xy[i].astype(np.float32).tolist()
-        s["cluster"] = int(cluster_ids[i])
+        if cluster_ids is not None:
+            s["cluster"] = int(cluster_ids[i])
         samples.append(s)
         pbar_build.update(1)
 
@@ -368,9 +462,32 @@ def main() -> None:
     args = parse_args()
     if not args.input_dir.exists():
         raise FileNotFoundError(f"Missing input dir: {args.input_dir}")
-    if str(args.dino_model).strip() != FIXED_DINO_MODEL:
-        print(f"forcing_dino_model={FIXED_DINO_MODEL} (requested={args.dino_model})")
-        args.dino_model = FIXED_DINO_MODEL
+
+    adapter_ckpt_raw = str(args.adapter_checkpoint).strip()
+    requested_backend = str(args.feature_backend)
+    if requested_backend == "auto":
+        feature_backend = "adapter" if adapter_ckpt_raw else "dino"
+    else:
+        feature_backend = requested_backend
+
+    adapter_checkpoint: Optional[Path] = None
+    if feature_backend == "adapter":
+        if not adapter_ckpt_raw:
+            raise ValueError("--adapter-checkpoint is required when --feature-backend=adapter")
+        adapter_checkpoint = Path(adapter_ckpt_raw)
+        if not adapter_checkpoint.exists() or not adapter_checkpoint.is_file():
+            raise FileNotFoundError(f"Missing adapter checkpoint file: {adapter_checkpoint}")
+        if int(args.adapter_input_size) > 0 and (int(args.adapter_input_size) % 256) != 0:
+            raise ValueError("--adapter-input-size must be multiple of 256")
+        if int(args.adapter_input_size) <= 0 and (int(args.tile_size) % 256) != 0:
+            raise ValueError(
+                "Adapter backend requires model input size multiple of 256. "
+                "Set --tile-size to multiple of 256 or use --adapter-input-size."
+            )
+    else:
+        if str(args.dino_model).strip() != FIXED_DINO_MODEL:
+            print(f"forcing_dino_model={FIXED_DINO_MODEL} (requested={args.dino_model})")
+            args.dino_model = FIXED_DINO_MODEL
 
     device = torch.device(args.device) if str(args.device).strip() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = [x.strip() for x in str(args.label_filter).split(",") if x.strip()]
@@ -379,6 +496,16 @@ def main() -> None:
     print(f"input_dir={args.input_dir}")
     print(f"labels={labels if labels else 'ALL'}")
     print(f"tile_size={args.tile_size} tile_context_scale={args.tile_context_scale}")
+    print(f"feature_backend={feature_backend}")
+    if feature_backend == "adapter":
+        print(f"adapter_checkpoint={adapter_checkpoint}")
+        print(f"adapter_feature_key={args.adapter_feature_key}")
+        print(f"adapter_input_size={(int(args.adapter_input_size) if int(args.adapter_input_size) > 0 else 'tile_size')}")
+    else:
+        print(f"dino_model={args.dino_model}")
+    print(f"run_kmeans={bool(args.run_kmeans)}")
+    if bool(args.run_kmeans):
+        print(f"num_clusters={int(args.num_clusters)}")
 
     metas = build_object_crops(
         input_dir=args.input_dir,
@@ -394,13 +521,23 @@ def main() -> None:
     print(f"objects={len(metas)}")
 
     print("stage=compute_embeddings")
-    emb = compute_embeddings(
-        metas=metas,
-        dino_model_name=str(args.dino_model),
-        device=device,
-        batch_size=int(args.batch_size),
-        trust_repo=bool(args.trust_torch_hub_repo),
-    )
+    if feature_backend == "adapter":
+        emb = compute_embeddings_adapter(
+            metas=metas,
+            checkpoint=adapter_checkpoint,
+            device=device,
+            batch_size=int(args.batch_size),
+            feature_key=str(args.adapter_feature_key),
+            adapter_input_size=int(args.adapter_input_size),
+        )
+    else:
+        emb = compute_embeddings_dino(
+            metas=metas,
+            dino_model_name=str(args.dino_model),
+            device=device,
+            batch_size=int(args.batch_size),
+            trust_repo=bool(args.trust_torch_hub_repo),
+        )
 
     print("stage=umap_fit_transform")
     reducer = umap.UMAP(
@@ -410,20 +547,31 @@ def main() -> None:
         random_state=int(args.seed),
     )
     um = reducer.fit_transform(emb)
-    print("stage=kmeans_fit_predict")
-    k = max(2, int(args.num_clusters))
-    if len(metas) < k:
-        k = max(2, min(len(metas), 8))
-    km = KMeans(n_clusters=k, random_state=int(args.seed), n_init=10)
-    cl = km.fit_predict(um).astype(np.int32)
+    cl: Optional[np.ndarray] = None
+    if bool(args.run_kmeans):
+        print("stage=kmeans_fit_predict")
+        k = max(2, int(args.num_clusters))
+        if len(metas) < k:
+            k = max(2, min(len(metas), 8))
+        km = KMeans(n_clusters=k, random_state=int(args.seed), n_init=10)
+        cl = km.fit_predict(um).astype(np.int32)
+    else:
+        print("stage=kmeans_fit_predict (skipped)")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.output_dir / "embeddings_umap.npz",
-        embedding=emb.astype(np.float32),
-        umap=um.astype(np.float32),
-        cluster=cl.astype(np.int32),
-    )
+    if cl is None:
+        np.savez_compressed(
+            args.output_dir / "embeddings_umap.npz",
+            embedding=emb.astype(np.float32),
+            umap=um.astype(np.float32),
+        )
+    else:
+        np.savez_compressed(
+            args.output_dir / "embeddings_umap.npz",
+            embedding=emb.astype(np.float32),
+            umap=um.astype(np.float32),
+            cluster=cl.astype(np.int32),
+        )
 
     ds = add_to_fiftyone(
         dataset_name=str(args.dataset_name),

@@ -17,6 +17,7 @@ import torch
 from transformers import Sam2Model, Sam2Processor
 
 from wtcv_utils.records import LabelmePair, load_labelme_pairs
+from wtcv_utils.sam_masks import post_process_masks_compat, resolve_postprocess_sizes
 
 @dataclass
 class Record:
@@ -288,42 +289,6 @@ def chunked(seq: List, size: int):
         yield seq[i : i + size]
 
 
-def resolve_postprocess_sizes(
-    inputs: Dict[str, torch.Tensor],
-    batch_images: List,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    SAM2 processor outputs can differ by version/prompt path.
-    Build robust fallbacks when size keys are missing.
-    """
-    original_sizes = inputs.get("original_sizes")
-    reshaped_sizes = inputs.get("reshaped_input_sizes")
-
-    if original_sizes is None:
-        orig_hw: List[List[int]] = []
-        for im in batch_images:
-            if hasattr(im, "size") and not isinstance(im, np.ndarray):
-                # PIL image: size=(W,H)
-                w, h = im.size
-                orig_hw.append([int(h), int(w)])
-            else:
-                # numpy image: shape=(H,W,C)
-                h, w = int(im.shape[0]), int(im.shape[1])
-                orig_hw.append([h, w])
-        original_sizes = torch.tensor(orig_hw, dtype=torch.int64, device=inputs["pixel_values"].device)
-
-    if reshaped_sizes is None:
-        ph = int(inputs["pixel_values"].shape[-2])
-        pw = int(inputs["pixel_values"].shape[-1])
-        reshaped_sizes = torch.tensor(
-            [[ph, pw] for _ in range(len(batch_images))],
-            dtype=torch.int64,
-            device=inputs["pixel_values"].device,
-        )
-
-    return original_sizes.detach().cpu(), reshaped_sizes.detach().cpu()
-
-
 def main() -> None:
     args = parse_args()
 
@@ -441,10 +406,11 @@ def main() -> None:
                 out = sam(**inputs, multimask_output=True)
 
             orig_sizes_cpu, reshaped_sizes_cpu = resolve_postprocess_sizes(inputs, batch_images)
-            post_masks = processor.image_processor.post_process_masks(
-                out.pred_masks.detach().cpu(),
-                orig_sizes_cpu,
-                reshaped_sizes_cpu,
+            post_masks = post_process_masks_compat(
+                image_processor=processor.image_processor,
+                pred_masks_cpu=out.pred_masks.detach().cpu(),
+                original_sizes_cpu=orig_sizes_cpu,
+                reshaped_sizes_cpu=reshaped_sizes_cpu,
             )
 
             for bi, rec in enumerate(batch_records):
@@ -606,10 +572,11 @@ def main() -> None:
                 out = sam(**inputs, multimask_output=True)
 
             orig_sizes_cpu, reshaped_sizes_cpu = resolve_postprocess_sizes(inputs, imgs)
-            post_masks = processor.image_processor.post_process_masks(
-                out.pred_masks.detach().cpu(),
-                orig_sizes_cpu,
-                reshaped_sizes_cpu,
+            post_masks = post_process_masks_compat(
+                image_processor=processor.image_processor,
+                pred_masks_cpu=out.pred_masks.detach().cpu(),
+                original_sizes_cpu=orig_sizes_cpu,
+                reshaped_sizes_cpu=reshaped_sizes_cpu,
             )
 
             for bi, task in enumerate(task_batch):

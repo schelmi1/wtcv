@@ -300,7 +300,9 @@ Script: `fiftyone_object_umap.py`
 
 Purpose:
 - Build one sample per object from LabelMe pairs.
-- Compute DINO masked object embeddings on object-centric tiles.
+- Compute masked object embeddings on object-centric tiles from either:
+  - raw DINO (`dinov2_vits14_reg`), or
+  - Stage1 adapter feature maps from an optional checkpoint.
 - Run UMAP + KMeans and write a FiftyOne dataset for fast clustered review.
 
 Example:
@@ -321,9 +323,14 @@ Common args:
 - `--output-dir`: saved object crops + `embeddings_umap.npz`.
 - `--label-filter`: comma-separated labels, case-insensitive.
 - `--tile-size`, `--tile-context-scale`.
-- DINO backbone is fixed to `dinov2_vits14_reg` in app/script workflows, plus `--batch-size`, `--device`.
+- `--feature-backend`: `auto|dino|adapter`.
+- `--adapter-checkpoint` (optional): when set with `auto`, adapter features are used.
+- `--adapter-feature-key`: `feat_adapted` or `feat_dino` for masked pooling.
+- `--adapter-input-size`: optional adapter resize (`0` uses tile size; must be multiple of 256 when > 0).
+- DINO path uses fixed backbone `dinov2_vits14_reg`, plus `--batch-size`, `--device`.
 - `--umap-n-neighbors`, `--umap-min-dist`, `--umap-metric`.
-- `--num-clusters`: KMeans clusters in UMAP space.
+- `--run-kmeans` (optional, default off): if enabled, fit KMeans and add `cluster` labels.
+- `--num-clusters`: KMeans cluster count (used only when `--run-kmeans` is enabled).
 - `--overwrite-dataset`, `--launch`.
 
 ---
