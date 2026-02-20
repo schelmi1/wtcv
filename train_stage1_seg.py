@@ -168,6 +168,35 @@ def print_kv_rows(rows: List[Tuple[str, object]], indent: str = "  ") -> None:
         print(f"{indent}{str(k):<{key_w}} : {v}")
 
 
+def summarize_annotation_counts(records: List[Dict]) -> Dict[str, int]:
+    pos_labels = 0
+    neg_labels = 0
+    images_with_pos = 0
+    images_with_neg = 0
+    for r in records:
+        objs = r.get("objects", []) or []
+        pos_i = 0
+        neg_i = 0
+        for o in objs:
+            if bool(o.get("is_fp", False)):
+                neg_i += 1
+            else:
+                pos_i += 1
+        pos_labels += pos_i
+        neg_labels += neg_i
+        if pos_i > 0:
+            images_with_pos += 1
+        if neg_i > 0:
+            images_with_neg += 1
+    return {
+        "images": int(len(records)),
+        "pos_labels": int(pos_labels),
+        "neg_labels": int(neg_labels),
+        "images_with_pos_labels": int(images_with_pos),
+        "images_with_neg_labels": int(images_with_neg),
+    }
+
+
 def _clip_polygon_to_rect(
     points: List[List[float]],
     x0: float,
@@ -321,6 +350,7 @@ class SegTileDataset(Dataset):
         non_obj_triplets = []
         fp_non_obj_triplets = []
         pure_non_obj_triplets = []
+        selected_fp_neg = 0
 
         for ridx, r in tqdm(
             enumerate(records),
@@ -380,14 +410,24 @@ class SegTileDataset(Dataset):
                         sel_neg.extend([pool2[i] for i in fill_sel])
             self.samples = [obj_triplets[i] for i in pos_sel] + sel_neg
             rng.shuffle(self.samples)
+            selected_fp_neg = int(n_fp)
         else:
             self.samples = all_triplets
+            selected_fp_neg = int(len(fp_non_obj_triplets))
 
         # Dataset-level positive/negative index lists (relative to self.samples).
         self.pos_dataset_indices = [i for i, s in enumerate(self.samples) if s["is_object"] == 1]
         self.neg_dataset_indices = [i for i, s in enumerate(self.samples) if s["is_object"] == 0]
         self.fp_neg_dataset_indices = [i for i, s in enumerate(self.samples) if (s["is_object"] == 0 and s["has_fp"] == 1)]
         self.neg_hard_scores = np.zeros(len(self.samples), dtype=np.float32)
+        self.stats = {
+            "all_tiles": int(len(all_triplets)),
+            "obj_pool": int(len(obj_triplets)),
+            "neg_pool": int(len(non_obj_triplets)),
+            "fp_neg_pool": int(len(fp_non_obj_triplets)),
+            "pure_neg_pool": int(len(pure_non_obj_triplets)),
+            "selected_fp_neg": int(selected_fp_neg),
+        }
 
         self.normalize = torchvision.transforms.Normalize(
             mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
@@ -398,6 +438,12 @@ class SegTileDataset(Dataset):
                 f"pos={len(self.pos_dataset_indices)} neg={len(self.neg_dataset_indices)} "
                 f"fp_neg={len(self.fp_neg_dataset_indices)} "
                 f"(balanced={self.balance_50_50} fp_neg_ratio={self.fp_neg_ratio:.2f})"
+            )
+            print(
+                f"{dataset_name}_pools: all={self.stats['all_tiles']} "
+                f"obj_pool={self.stats['obj_pool']} neg_pool={self.stats['neg_pool']} "
+                f"fp_neg_pool={self.stats['fp_neg_pool']} pure_neg_pool={self.stats['pure_neg_pool']} "
+                f"selected_fp_neg={self.stats['selected_fp_neg']}"
             )
 
     def __len__(self) -> int:
@@ -1379,6 +1425,7 @@ def main() -> None:
     )
     if len(records) == 0:
         raise RuntimeError("No records found.")
+    counts_all = summarize_annotation_counts(records)
 
     rng = np.random.default_rng(cfg.seed)
     order = np.arange(len(records))
@@ -1390,6 +1437,10 @@ def main() -> None:
             ("run_dir", run_dir),
             ("checkpoints_dir", ckpt_dir),
             ("records_loaded", len(records)),
+            ("labels_pos_loaded", counts_all["pos_labels"]),
+            ("labels_neg_loaded", counts_all["neg_labels"]),
+            ("images_with_pos_labels", counts_all["images_with_pos_labels"]),
+            ("images_with_neg_labels", counts_all["images_with_neg_labels"]),
             ("resume_checkpoint", str(cfg.resume_checkpoint) if cfg.resume_checkpoint else "None"),
             ("seed", cfg.seed),
         ]
@@ -1497,6 +1548,8 @@ def main() -> None:
     split = int(0.95 * len(records))
     train_records = records[:split]
     val_records = records[split:]
+    train_counts = summarize_annotation_counts(train_records)
+    val_counts = summarize_annotation_counts(val_records)
 
     tile_configs = parse_tile_configs(cfg.tile_size, cfg.tile_stride, cfg.tile_scales)
     print_section("Dataset Build")
@@ -1504,6 +1557,10 @@ def main() -> None:
         [
             ("train_records", len(train_records)),
             ("val_records", len(val_records)),
+            ("train_labels_pos", train_counts["pos_labels"]),
+            ("train_labels_neg", train_counts["neg_labels"]),
+            ("val_labels_pos", val_counts["pos_labels"]),
+            ("val_labels_neg", val_counts["neg_labels"]),
             ("tile_configs", tile_configs),
         ]
     )
@@ -1555,6 +1612,9 @@ def main() -> None:
     pos_tiles = len(getattr(train_ds, "pos_dataset_indices", []))
     neg_tiles = len(getattr(train_ds, "neg_dataset_indices", []))
     fp_neg_tiles = len(getattr(train_ds, "fp_neg_dataset_indices", []))
+    fp_neg_frac = (float(fp_neg_tiles) / float(max(1, neg_tiles))) if neg_tiles > 0 else float("nan")
+    train_fp_pool = int(getattr(train_ds, "stats", {}).get("fp_neg_pool", 0))
+    train_neg_pool = int(getattr(train_ds, "stats", {}).get("neg_pool", 0))
     print_kv_rows(
         [
             ("subset", subset_note),
@@ -1563,6 +1623,9 @@ def main() -> None:
             ("train_pos_tiles", pos_tiles),
             ("train_neg_tiles", neg_tiles),
             ("train_fp_neg_tiles", fp_neg_tiles),
+            ("train_fp_neg_frac_of_neg", f"{fp_neg_frac:.3f}"),
+            ("train_neg_pool_pre_balance", train_neg_pool),
+            ("train_fp_neg_pool_pre_balance", train_fp_pool),
         ]
     )
     if len(getattr(train_ds, "pos_dataset_indices", [])) == 0:
@@ -1644,11 +1707,19 @@ def main() -> None:
     if len(optimizer_params) == 0:
         raise RuntimeError("No optimizer parameters collected for training schedule.")
 
+    # For resumed runs, stage schedules are interpreted relative to the resume base epoch.
+    # Example: resume_base_epoch=50, head_warmup_epoch=1 means heads start at epoch 51.
+    schedule_epoch_offset = 0
+
+    def _schedule_epoch(epoch_now: int) -> int:
+        return max(1, int(epoch_now) - int(schedule_epoch_offset))
+
     def apply_epoch_unfreeze_schedule(epoch_now: int) -> Tuple[str, int]:
-        heads_on = int(epoch_now) >= int(cfg.head_warmup_epoch)
-        fuser_on = (fuser_module is not None) and (int(epoch_now) >= int(cfg.fuser_unfreeze_epoch))
-        dinoup_on = (dinoup_module is not None) and (int(epoch_now) >= int(cfg.dinoup_unfreeze_epoch))
-        local_on = (len(local_sched_modules) > 0) and (int(epoch_now) >= int(cfg.dinoup_unfreeze_epoch))
+        se = _schedule_epoch(epoch_now)
+        heads_on = int(se) >= int(cfg.head_warmup_epoch)
+        fuser_on = (fuser_module is not None) and (int(se) >= int(cfg.fuser_unfreeze_epoch))
+        dinoup_on = (dinoup_module is not None) and (int(se) >= int(cfg.dinoup_unfreeze_epoch))
+        local_on = (len(local_sched_modules) > 0) and (int(se) >= int(cfg.dinoup_unfreeze_epoch))
 
         for m in head_modules:
             set_module_requires_grad(m, heads_on)
@@ -1658,6 +1729,7 @@ def main() -> None:
             set_module_requires_grad(m, local_on)
 
         phase_parts = [
+            f"sched_epoch={se}",
             f"heads={'on' if heads_on else 'off'}",
             f"fuser={'on' if fuser_on else 'off'}",
             f"dinoup={'on' if dinoup_on else 'off'}",
@@ -1667,10 +1739,10 @@ def main() -> None:
         return ", ".join(phase_parts), int(n_trainable_now)
 
     def get_epoch_lr_scale(epoch_now: int) -> float:
-        e = int(epoch_now)
-        if e < int(cfg.fuser_unfreeze_epoch):
+        e = _schedule_epoch(epoch_now)
+        if int(e) < int(cfg.fuser_unfreeze_epoch):
             return float(cfg.head_phase_lr_scale)
-        if e < int(cfg.dinoup_unfreeze_epoch):
+        if int(e) < int(cfg.dinoup_unfreeze_epoch):
             return float(cfg.fuser_phase_lr_scale)
         return 1.0
 
@@ -1778,6 +1850,7 @@ def main() -> None:
             history = list(resume_blob.get("history", []))
             best_val_iou = float(resume_blob.get("best_val_iou", best_val_iou))
             resume_base_epoch = int(resume_blob.get("epoch", 0))
+            schedule_epoch_offset = int(resume_base_epoch)
             start_epoch = resume_base_epoch + 1
             train_global_step = int(resume_blob.get("train_global_step", 0))
             val_global_step = int(resume_blob.get("val_global_step", 0))
@@ -1787,6 +1860,7 @@ def main() -> None:
             [
                 ("resumed_from", resume_ckpt),
                 ("resume_base_epoch", resume_base_epoch),
+                ("schedule_epoch_offset", schedule_epoch_offset),
                 ("start_epoch", start_epoch),
                 ("target_end_epoch", target_end_epoch),
                 ("best_val_iou", f"{best_val_iou:.4f}"),

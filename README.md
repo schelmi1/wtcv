@@ -42,9 +42,11 @@ Scripts migrated to use these shared helpers:
 - `wtcv_gradio_app.py`
 - `augment_record_pairs_with_polygons.py`
 - `sam1_box_to_poly_batched.py`
+- `sam2_box_to_poly_batched.py`
 - `fiftyone_object_umap.py`
 - `build_embedding_bank.py`
 - `unique_images_vs_embedding_bank.py`
+- `score_dataset_with_embedding_bank.py`
 - `fiftyone_export_tagged_to_labelme.py`
 - `media_source_inference_cv2.py`
 - `train_stage1_seg.py`
@@ -61,16 +63,20 @@ Purpose:
 - Browser UI that unifies the main workflows:
   - Train
   - Evaluate
-  - SAM bbox->polygon conversion
+  - Refinement (SAM1 + SAM2 bbox->polygon conversion)
   - Dataset augmentation
-  - Curation launcher (OpenCV window)
-  - Media-source inference (folder/video, optional UI)
-  - Live screen inference (OpenCV UI)
+  - Data Curation Toolkit:
+    - Curation launcher (OpenCV window)
+    - Single-image inference
+    - Dataset peek
+    - Video -> frames
+    - Full Dataset vs Embedding Bank
+  - Media Inference (super tab):
+    - Batched image-folder inference (tile dataloader, no UI)
+    - Media-source inference (folder/video, optional UI)
+    - Live screen inference (OpenCV UI)
   - Object UMAP + FiftyOne export
   - Embedding bank builder (from LabelMe folders)
-  - Single-image tiled inference preview
-  - Dataset peek/stats
-  - Video -> frames extraction
 
 Install:
 ```bash
@@ -162,6 +168,19 @@ Common args:
   - `--preserve-bg-weight`, `--preserve-fg-weight`
   - `--var-weight`, `--var-gamma`
 
+FP balancing behavior (important):
+- With `--balance-train-50-50`, train tiles are balanced so `pos_tiles == neg_tiles`.
+- `--fp-neg-ratio` is applied only inside the selected negative half.
+- Expected FP-negative count is approximately:
+  `train_fp_neg_tiles ~= min(fp_neg_pool, round(train_neg_tiles * fp_neg_ratio))`
+- Example: if `train_tiles=23k`, then `train_neg_tiles=11.5k`. With `--fp-neg-ratio 0.5`, expected `train_fp_neg_tiles` is about `5.7k` (assuming FP-negative pool is large enough).
+- `train_fp_neg_tiles` counts tiles with `is_object=0` and `has_fp=1`. Tiles that contain both a true vehicle and `fp` annotations are counted as positive tiles, not FP-negative tiles.
+
+Current dataset logging includes:
+- pre-balance pools (`obj_pool`, `neg_pool`, `fp_neg_pool`, `pure_neg_pool`)
+- selected FP negatives after balancing
+- `train_fp_neg_frac_of_neg`
+
 ---
 
 ### 2) Evaluate stage-1 checkpoint
@@ -234,7 +253,7 @@ python sam1_box_to_poly_batched.py \
 
 Common args:
 - `--input-dir`: LabelMe pairs with rectangle shapes.
-- `--prompt-mode {bbox,point}`: bbox prompts or center-of-gravity point prompts (for polygon datasets).
+- `--prompt-mode {bbox,point}`: bbox prompts or center-of-gravity point prompts (for polygon datasets). Current default is `point`.
 - `--output-dir`: converted pairs destination.
 - `--model-id`: HF SAM model id (default `facebook/sam-vit-base`).
 - `--device`: `cuda` or `cpu`.
@@ -337,8 +356,11 @@ Common args:
 Script: `build_embedding_bank.py`
 
 Purpose:
-- Build masked DINO object embeddings from LabelMe image/json pairs.
+- Build masked object embeddings from LabelMe image/json pairs.
 - Save reusable bank artifacts for similarity search / reference matching.
+- Supports two backends:
+  - `dino`: raw DINO patch-token features (fixed `dinov2_vits14_reg`)
+  - `adapter`: Stage1 checkpoint features (`feat_adapted` or `feat_dino`)
 
 Example:
 ```bash
@@ -355,6 +377,15 @@ Outputs:
 - `embedding_bank_meta.jsonl` (per-object metadata rows)
 - `embedding_prototypes.npz` (mean normalized prototype per label)
 - `embedding_bank_manifest.json` (run config + file index)
+
+Important args:
+- `--feature-backend {dino,adapter}`
+- `--adapter-checkpoint` (required when backend is `adapter`)
+- `--adapter-feature-key {feat_adapted,feat_dino}`
+- `--adapter-input-size` (optional; must be multiple of 256 for adapter backend)
+- `--max-objects`
+  - If `>0`, both `tile stream` and `dino masked pool iters` progress bars run with exact totals.
+  - If `0`, script pre-counts valid objects to set progress total.
 
 ---
 
@@ -383,6 +414,44 @@ Common args:
 - `--tile-size`, `--tile-stride`, `--pred-threshold`.
 - `--use-tile-cls-gating`, `--tile-cls-threshold`, `--tile-cls-mode`.
 - `--infer-every`, `--max-fps`, `--start-index`, `--max-items`.
+
+---
+
+### 9b) Batched Image Folder Inference (tile dataloader)
+Script: `batch_image_folder_inference.py`
+
+Purpose:
+- High-throughput inference for image folders by batching tiles across multiple images.
+- Uses `torch.utils.data.DataLoader` + worker processes to decode/tiling in parallel.
+- Stitches per-tile probabilities back to per-image maps and exports LabelMe image/json outputs.
+
+Example:
+```bash
+python batch_image_folder_inference.py \
+  --checkpoint /home/schelli/git/wtcv/runs/<run>/checkpoints/final.pt \
+  --input-path /home/schelli/git/wtcv/data/record_pairs \
+  --output-dir /home/schelli/git/wtcv/data/batch_inference_labelme \
+  --tile-size 512 \
+  --tile-stride 512 \
+  --tile-batch-size 32 \
+  --num-workers 8 \
+  --amp
+```
+
+Common args:
+- `--input-path`: image directory or single image file.
+- `--tile-batch-size`: number of tiles per model forward pass.
+- `--num-workers`: dataloader workers for image decode + tile emission.
+- `--tile-size` (must be multiple of 256 for current model), `--tile-stride`, `--seg-out-stride`.
+- `--pred-threshold`, `--min-poly-area`, `--poly-epsilon-frac`.
+- `--use-tile-cls-gating`, `--tile-cls-threshold`, `--tile-cls-mode`.
+- `--start-index`, `--max-images`, `--recursive`.
+- `--save-empty` (also write empty-json outputs), `--overwrite`.
+
+Outputs:
+- LabelMe image/json pairs in `--output-dir`
+- `batch_infer_summary.jsonl` (per-image stats)
+- `batch_infer_summary.json` (run-level summary)
 
 ---
 
@@ -443,6 +512,10 @@ Pipeline:
 5. Extract and embed objects only from selected images.
 6. Score object novelty versus bank embeddings (`1 - max_bank_cos`).
 
+Object embedding backend:
+- `--feature-backend {dino,adapter}` for the object-vs-bank step.
+- Scene uniqueness embeddings remain raw DINO image embeddings.
+
 Example:
 ```bash
 python unique_images_vs_embedding_bank.py \
@@ -460,6 +533,56 @@ Outputs:
 - `selected_unique_labelme/` (copied valid LabelMe pairs for selected unique images)
 - `objects_vs_bank.csv` (object novelty vs bank)
 - `top_novel_objects.json`
+
+---
+
+### 12) Full Dataset vs Embedding Bank (Auto-add positives)
+Script: `score_dataset_with_embedding_bank.py`
+
+Purpose:
+- Run model detections over a full image dataset.
+- Score each detected polygon against a positive embedding-bank subset.
+- Keep original LabelMe labels unchanged.
+- Add only accepted positive candidates as new shapes.
+
+Current strategy:
+1. Load existing image/json pair (or create empty LabelMe json if missing).
+2. Run tiled inference and polygon extraction.
+3. Embed each predicted polygon (backend selectable):
+   - `--feature-backend auto|dino|adapter`
+   - `auto` resolves from embedding-bank manifest config.
+4. Compute top-k cosine similarity vs positive bank subset.
+5. Add candidate if score passes threshold and is not duplicate by IoU.
+
+Label behavior:
+- Added shapes are always written with `_auto` suffix:
+  - e.g. `vehicle -> vehicle_auto`
+- Existing labels are preserved.
+
+Example:
+```bash
+python score_dataset_with_embedding_bank.py \
+  --input-dir /home/schelli/git/wtcv/data/record_pairs \
+  --checkpoint /home/schelli/git/wtcv/runs/<run>/checkpoints/final.pt \
+  --embedding-bank /home/schelli/git/wtcv/outputs/embedding_bank/embedding_bank.npz \
+  --output-dir /home/schelli/git/wtcv/outputs/dataset_vs_embedding_bank \
+  --feature-backend auto \
+  --positive-labels vehicle,vehicle_auto \
+  --accept-score 0.35 \
+  --dedup-iou 0.30
+```
+
+Key args:
+- `--feature-backend {auto,dino,adapter}`
+  - `adapter` uses the same `--checkpoint` as adapter source.
+  - no separate adapter checkpoint in this workflow.
+- `--adapter-feature-key {feat_adapted,feat_dino}`
+- `--adapter-input-size` (optional; multiple of 256)
+- `--positive-labels`
+- `--bank-topk`
+- `--accept-score`
+- `--dedup-iou`
+- `--vehicle-label` (base label before `_auto` suffixing)
 
 ## Notebooks
 
@@ -491,6 +614,7 @@ python augment_record_pairs_with_polygons.py --help
 python fiftyone_object_umap.py --help
 python build_embedding_bank.py --help
 python unique_images_vs_embedding_bank.py --help
+python score_dataset_with_embedding_bank.py --help
 python report_object_cosine_similarity.py --help
 python fiftyone_export_tagged_to_labelme.py --help
 python media_source_inference_cv2.py --help

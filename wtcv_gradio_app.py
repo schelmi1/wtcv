@@ -10,7 +10,9 @@ except Exception as exc:  # pragma: no cover - runtime dependency guard
 
 from wtcv_app.common import ROOT
 from wtcv_app.tabs.augment_tab import build_tab as build_augment_tab
+from wtcv_app.tabs.batched_image_infer_tab import build_tab as build_batched_image_infer_tab
 from wtcv_app.tabs.curation_tab import build_tab as build_curation_tab
+from wtcv_app.tabs.dataset_vs_bank_tab import build_tab as build_dataset_vs_bank_tab
 from wtcv_app.tabs.dataset_peek_tab import build_tab as build_dataset_peek_tab
 from wtcv_app.tabs.embedding_bank_tab import build_tab as build_embedding_bank_tab
 from wtcv_app.tabs.eval_tab import build_tab as build_eval_tab
@@ -18,6 +20,7 @@ from wtcv_app.tabs.live_screen_tab import build_tab as build_live_screen_tab
 from wtcv_app.tabs.media_source_tab import build_tab as build_media_source_tab
 from wtcv_app.tabs.object_umap_tab import build_tab as build_object_umap_tab
 from wtcv_app.tabs.sam_tab import build_tab as build_sam_tab
+from wtcv_app.tabs.sam2_tab import build_tab as build_sam2_tab
 from wtcv_app.tabs.single_image_tab import build_tab as build_single_image_tab
 from wtcv_app.tabs.train_tab import build_tab as build_train_tab
 from wtcv_app.tabs.video_frames_tab import build_tab as build_video_frames_tab
@@ -174,7 +177,10 @@ def make_app() -> gr.Blocks:
         with gr.Tabs():
             build_train_tab(ROOT)
             build_eval_tab(ROOT)
-            build_sam_tab(ROOT)
+            with gr.Tab("Refinement"):
+                with gr.Tabs():
+                    build_sam_tab(ROOT)
+                    build_sam2_tab(ROOT)
             build_augment_tab(ROOT)
             with gr.Tab("Data Curation Toolkit"):
                 with gr.Tabs():
@@ -186,10 +192,18 @@ def make_app() -> gr.Blocks:
                         build_dataset_peek_tab(ROOT, nested=True)
                     with gr.Tab("Video -> Frames"):
                         build_video_frames_tab(ROOT, nested=True)
+                    with gr.Tab("Dataset vs Bank"):
+                        build_dataset_vs_bank_tab(ROOT, nested=True)
             build_embedding_bank_tab(ROOT)
             build_object_umap_tab(ROOT)
-            build_media_source_tab(ROOT)
-            build_live_screen_tab(ROOT)
+            with gr.Tab("Media Inference"):
+                with gr.Tabs():
+                    with gr.Tab("Batched Image Inference"):
+                        build_batched_image_infer_tab(ROOT, nested=True)
+                    with gr.Tab("Media Source (CV2/Headless)"):
+                        build_media_source_tab(ROOT, nested=True)
+                    with gr.Tab("Live Screen (CV2 UI)"):
+                        build_live_screen_tab(ROOT, nested=True)
 
     return app
 

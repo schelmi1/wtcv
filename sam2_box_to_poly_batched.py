@@ -14,7 +14,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 import torch
-from transformers import SamModel, SamProcessor
+from transformers import Sam2Model, Sam2Processor
 
 from wtcv_utils.records import LabelmePair, load_labelme_pairs
 
@@ -28,10 +28,10 @@ class Record:
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Convert LabelMe bbox annotations to polygons with batched SAM1")
+    ap = argparse.ArgumentParser(description="Convert LabelMe bbox annotations to polygons with batched SAM2")
     ap.add_argument("--input-dir", type=Path, required=True, help="Folder with LabelMe image/json pairs")
-    ap.add_argument("--output-dir", type=Path, default=Path("data/sam_box_to_poly"))
-    ap.add_argument("--model-id", type=str, default="facebook/sam-vit-base")
+    ap.add_argument("--output-dir", type=Path, default=Path("data/sam2_box_to_poly"))
+    ap.add_argument("--model-id", type=str, default="facebook/sam2-hiera-small")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--image-batch-size", type=int, default=4, help="How many images per SAM forward pass")
     ap.add_argument("--prompt-mode", type=str, choices=["bbox", "point"], default="point")
@@ -288,6 +288,42 @@ def chunked(seq: List, size: int):
         yield seq[i : i + size]
 
 
+def resolve_postprocess_sizes(
+    inputs: Dict[str, torch.Tensor],
+    batch_images: List,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    SAM2 processor outputs can differ by version/prompt path.
+    Build robust fallbacks when size keys are missing.
+    """
+    original_sizes = inputs.get("original_sizes")
+    reshaped_sizes = inputs.get("reshaped_input_sizes")
+
+    if original_sizes is None:
+        orig_hw: List[List[int]] = []
+        for im in batch_images:
+            if hasattr(im, "size") and not isinstance(im, np.ndarray):
+                # PIL image: size=(W,H)
+                w, h = im.size
+                orig_hw.append([int(h), int(w)])
+            else:
+                # numpy image: shape=(H,W,C)
+                h, w = int(im.shape[0]), int(im.shape[1])
+                orig_hw.append([h, w])
+        original_sizes = torch.tensor(orig_hw, dtype=torch.int64, device=inputs["pixel_values"].device)
+
+    if reshaped_sizes is None:
+        ph = int(inputs["pixel_values"].shape[-2])
+        pw = int(inputs["pixel_values"].shape[-1])
+        reshaped_sizes = torch.tensor(
+            [[ph, pw] for _ in range(len(batch_images))],
+            dtype=torch.int64,
+            device=inputs["pixel_values"].device,
+        )
+
+    return original_sizes.detach().cpu(), reshaped_sizes.detach().cpu()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -302,9 +338,9 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
-    print(f"Loading SAM: {args.model_id} on {device}")
-    processor = SamProcessor.from_pretrained(args.model_id)
-    sam = SamModel.from_pretrained(args.model_id).to(device).eval()
+    print(f"Loading SAM2: {args.model_id} on {device}")
+    processor = Sam2Processor.from_pretrained(args.model_id)
+    sam = Sam2Model.from_pretrained(args.model_id).to(device).eval()
 
     records = load_records(args.input_dir, args.load_workers, label_filter=args.label_filter, max_images=args.max_images)
 
@@ -404,10 +440,11 @@ def main() -> None:
             with torch.no_grad():
                 out = sam(**inputs, multimask_output=True)
 
+            orig_sizes_cpu, reshaped_sizes_cpu = resolve_postprocess_sizes(inputs, batch_images)
             post_masks = processor.image_processor.post_process_masks(
                 out.pred_masks.detach().cpu(),
-                inputs["original_sizes"].detach().cpu(),
-                inputs["reshaped_input_sizes"].detach().cpu(),
+                orig_sizes_cpu,
+                reshaped_sizes_cpu,
             )
 
             for bi, rec in enumerate(batch_records):
@@ -445,7 +482,7 @@ def main() -> None:
                                 "points": poly,
                                 "group_id": src_shape.get("group_id"),
                                 "shape_type": "polygon",
-                                "flags": {**flags, "source": "sam1_box_to_poly"},
+                                "flags": {**flags, "source": "sam2_box_to_poly"},
                             }
                         )
                     repl[si] = ns
@@ -568,10 +605,11 @@ def main() -> None:
             with torch.no_grad():
                 out = sam(**inputs, multimask_output=True)
 
+            orig_sizes_cpu, reshaped_sizes_cpu = resolve_postprocess_sizes(inputs, imgs)
             post_masks = processor.image_processor.post_process_masks(
                 out.pred_masks.detach().cpu(),
-                inputs["original_sizes"].detach().cpu(),
-                inputs["reshaped_input_sizes"].detach().cpu(),
+                orig_sizes_cpu,
+                reshaped_sizes_cpu,
             )
 
             for bi, task in enumerate(task_batch):
@@ -607,7 +645,7 @@ def main() -> None:
                             "points": full_poly,
                             "group_id": src_shape.get("group_id"),
                             "shape_type": "polygon",
-                            "flags": {**flags, "source": "sam1_box_to_poly"},
+                            "flags": {**flags, "source": "sam2_box_to_poly"},
                         }
                     )
                 rec_repl[rec_key][si] = ns

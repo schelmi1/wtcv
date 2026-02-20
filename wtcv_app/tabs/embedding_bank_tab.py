@@ -18,6 +18,10 @@ def run_embedding_bank(
     tile_context_scale: float,
     min_poly_points: int,
     batch_size: int,
+    feature_backend: str,
+    adapter_checkpoint: str,
+    adapter_feature_key: str,
+    adapter_input_size: int,
     device: str,
     trust_torch_hub_repo: bool,
 ) -> Generator[Tuple[str, str], None, None]:
@@ -41,9 +45,17 @@ def run_embedding_bank(
         str(int(min_poly_points)),
         "--batch-size",
         str(int(batch_size)),
+        "--feature-backend",
+        str(feature_backend).strip().lower(),
+        "--adapter-feature-key",
+        str(adapter_feature_key).strip(),
+        "--adapter-input-size",
+        str(int(adapter_input_size)),
         "--device",
         str(device),
     ]
+    if str(adapter_checkpoint).strip():
+        cmd += ["--adapter-checkpoint", str(adapter_checkpoint).strip()]
     cmd += build_bool_arg("--trust-torch-hub-repo", "--no-trust-torch-hub-repo", bool(trust_torch_hub_repo))
     yield from stream_command(cmd)
 
@@ -116,6 +128,10 @@ def run_unique_vs_bank(
     max_objects: int,
     batch_size: int,
     bank_topk: int,
+    feature_backend: str,
+    adapter_checkpoint: str,
+    adapter_feature_key: str,
+    adapter_input_size: int,
     device: str,
     trust_torch_hub_repo: bool,
 ) -> Generator[Tuple[str, str], None, None]:
@@ -155,9 +171,17 @@ def run_unique_vs_bank(
         str(int(batch_size)),
         "--bank-topk",
         str(int(bank_topk)),
+        "--feature-backend",
+        str(feature_backend).strip().lower(),
+        "--adapter-feature-key",
+        str(adapter_feature_key).strip(),
+        "--adapter-input-size",
+        str(int(adapter_input_size)),
         "--device",
         str(device),
     ]
+    if str(adapter_checkpoint).strip():
+        cmd += ["--adapter-checkpoint", str(adapter_checkpoint).strip()]
     cmd += build_bool_arg("--trust-torch-hub-repo", "--no-trust-torch-hub-repo", bool(trust_torch_hub_repo))
     yield from stream_command(cmd)
 
@@ -226,6 +250,30 @@ def build_tab(root: Path) -> None:
                 label="Trust torch.hub repo",
                 info="Allow torch.hub to trust and execute repository code without prompt.",
             )
+        with gr.Row():
+            bank_feature_backend = gr.Dropdown(
+                choices=["dino", "adapter"],
+                value="dino",
+                label="Feature Backend",
+                info="`dino` uses raw DINO patch-token embeddings. `adapter` uses a Stage1 checkpoint feature map.",
+            )
+            bank_adapter_ckpt = gr.Textbox(
+                value="",
+                label="Adapter Checkpoint (for backend=adapter)",
+                info="Path to Stage1 checkpoint to extract adapted features from.",
+            )
+            bank_adapter_feature_key = gr.Dropdown(
+                choices=["feat_adapted", "feat_dino"],
+                value="feat_adapted",
+                label="Adapter Feature Key",
+                info="Feature map key returned by Stage1 model when backend=adapter.",
+            )
+            bank_adapter_input_size = gr.Number(
+                value=0,
+                precision=0,
+                label="Adapter Input Size (0=tile size)",
+                info="Optional square resize before adapter forward. Must be multiple of 256 for adapter backend.",
+            )
         bank_btn = gr.Button("Build Embedding Bank", variant="primary")
         bank_cmd = gr.Textbox(label="Command", interactive=False)
         bank_logs = gr.Textbox(label="Live Logs", lines=22, elem_classes=["mono"], interactive=False)
@@ -240,6 +288,10 @@ def build_tab(root: Path) -> None:
                 bank_context,
                 bank_min_poly_points,
                 bank_batch,
+                bank_feature_backend,
+                bank_adapter_ckpt,
+                bank_adapter_feature_key,
+                bank_adapter_input_size,
                 bank_device,
                 bank_trust_repo,
             ],
@@ -462,6 +514,30 @@ def build_tab(root: Path) -> None:
                 label="Trust torch.hub repo",
                 info="Allow torch.hub to trust and execute repository code without prompt.",
             )
+        with gr.Row():
+            uvb_feature_backend = gr.Dropdown(
+                choices=["dino", "adapter"],
+                value="dino",
+                label="Object Feature Backend",
+                info="Backend used for object-vs-bank embeddings on selected unique scenes.",
+            )
+            uvb_adapter_ckpt = gr.Textbox(
+                value="",
+                label="Adapter Checkpoint (backend=adapter)",
+                info="Stage1 checkpoint path used when Object Feature Backend is adapter.",
+            )
+            uvb_adapter_feature_key = gr.Dropdown(
+                choices=["feat_adapted", "feat_dino"],
+                value="feat_adapted",
+                label="Adapter Feature Key",
+                info="Feature map key used for masked pooling in adapter backend.",
+            )
+            uvb_adapter_input_size = gr.Number(
+                value=0,
+                precision=0,
+                label="Adapter Input Size (0=tile size)",
+                info="Optional adapter forward resize; must be multiple of 256.",
+            )
         uvb_btn = gr.Button("Run Unique Scenes -> Object-vs-Bank", variant="primary")
         uvb_cmd = gr.Textbox(label="Unique-vs-Bank Command", interactive=False)
         uvb_logs = gr.Textbox(label="Unique-vs-Bank Logs", lines=20, elem_classes=["mono"], interactive=False)
@@ -484,6 +560,10 @@ def build_tab(root: Path) -> None:
                 uvb_max_objects,
                 uvb_obj_batch,
                 uvb_bank_topk,
+                uvb_feature_backend,
+                uvb_adapter_ckpt,
+                uvb_adapter_feature_key,
+                uvb_adapter_input_size,
                 uvb_device,
                 uvb_trust_repo,
             ],

@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -16,6 +17,7 @@ import torch.nn.functional as F
 import torchvision
 from torchvision.transforms import functional as TF
 
+from curate_model_predictions_to_labelme import load_model
 from wtcv_utils.labelme import polygon_area, polygon_bbox, shape_to_points
 from wtcv_utils.records import load_labelme_pairs
 
@@ -45,6 +47,32 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-poly-points", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=12)
     ap.add_argument("--load-workers", type=int, default=8)
+    ap.add_argument(
+        "--feature-backend",
+        type=str,
+        choices=["dino", "adapter"],
+        default="dino",
+        help="Feature extractor backend for object embeddings.",
+    )
+    ap.add_argument(
+        "--adapter-checkpoint",
+        type=str,
+        default="",
+        help="Checkpoint path required when --feature-backend=adapter.",
+    )
+    ap.add_argument(
+        "--adapter-feature-key",
+        type=str,
+        choices=["feat_adapted", "feat_dino"],
+        default="feat_adapted",
+        help="Stage1 feature map to masked-pool in adapter backend.",
+    )
+    ap.add_argument(
+        "--adapter-input-size",
+        type=int,
+        default=0,
+        help="Optional square resize for adapter backend before forward (0 keeps tile_size). Must be multiple of 256.",
+    )
 
     ap.add_argument("--dino-model", type=str, default=FIXED_DINO_MODEL)
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
@@ -172,6 +200,36 @@ def iter_object_tiles(
                 return
 
 
+def estimate_total_objects(
+    input_dir: Path,
+    label_filter: Sequence[str],
+    min_poly_points: int,
+    max_objects: int,
+    load_workers: int,
+) -> int:
+    label_set = {str(x).strip().casefold() for x in label_filter if str(x).strip()}
+    pairs = load_labelme_pairs(
+        input_dir,
+        load_workers=max(1, int(load_workers)),
+        progress_desc="count objects",
+        progress_leave=False,
+    )
+    total = 0
+    for pair in pairs:
+        shapes = pair.json_data.get("shapes", []) or []
+        for s in shapes:
+            label_cf = str(s.get("label", "")).strip().casefold()
+            if label_set and label_cf not in label_set:
+                continue
+            pts = shape_to_points(s, min_poly_points=min_poly_points)
+            if pts is None:
+                continue
+            total += 1
+            if max_objects > 0 and total >= int(max_objects):
+                return int(max_objects)
+    return int(total)
+
+
 def _token_grid_shape(num_tokens: int) -> Tuple[int, int]:
     gh = int(round(float(np.sqrt(num_tokens))))
     if gh <= 0:
@@ -187,6 +245,7 @@ def compute_bank(
     device: torch.device,
     batch_size: int,
     trust_repo: bool,
+    total_objects: int | None = None,
 ) -> Tuple[np.ndarray, List[Dict]]:
     model = torch.hub.load("facebookresearch/dinov2", dino_model_name, trust_repo=trust_repo).to(device).eval()
     for p in model.parameters():
@@ -197,6 +256,15 @@ def compute_bank(
     pending_tiles: List[torch.Tensor] = []
     pending_masks: List[np.ndarray] = []
     pending_meta: List[Dict] = []
+    is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    # Avoid nested tqdm control sequences ("\x1b[A") in captured/non-TTY logs.
+    show_tile_bar = is_tty
+    masked_pool_pbar = tqdm(
+        total=(int(total_objects) if total_objects is not None and int(total_objects) > 0 else None),
+        desc="dino masked pool iters",
+        unit="obj",
+        dynamic_ncols=is_tty,
+    )
 
     def flush() -> None:
         nonlocal pending_tiles, pending_masks, pending_meta
@@ -214,20 +282,96 @@ def compute_bank(
             v = F.normalize(v, dim=0)
             embeddings.append(v.detach().cpu().numpy().astype(np.float32))
             metadata.append(pending_meta[i])
+            masked_pool_pbar.update(1)
         pending_tiles = []
         pending_masks = []
         pending_meta = []
 
-    for t in tqdm(tiles, desc="dino masked pool"):
+    tile_iter = tqdm(tiles, desc="tile stream", unit="tile", leave=False, dynamic_ncols=True) if show_tile_bar else tiles
+    for t in tile_iter:
         pending_tiles.append(t.tile_tensor)
         pending_masks.append(t.mask_u8)
         pending_meta.append(t.meta)
         if len(pending_tiles) >= max(1, int(batch_size)):
             flush()
     flush()
+    masked_pool_pbar.close()
 
     if not embeddings:
         raise RuntimeError("No embeddings computed. Check --input-dir and --label-filter.")
+    return np.stack(embeddings, axis=0), metadata
+
+
+def compute_bank_with_adapter(
+    tiles: Iterable[ObjectTile],
+    checkpoint: Path,
+    device: torch.device,
+    batch_size: int,
+    feature_key: str,
+    adapter_input_size: int,
+    total_objects: int | None = None,
+) -> Tuple[np.ndarray, List[Dict]]:
+    model, info = load_model(checkpoint=checkpoint, device=device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    print(f"adapter_model_info={info}")
+    print(f"adapter_feature_key={feature_key}")
+    print(f"adapter_input_size={(adapter_input_size if adapter_input_size > 0 else 'tile_size')}")
+
+    embeddings: List[np.ndarray] = []
+    metadata: List[Dict] = []
+    pending_tiles: List[torch.Tensor] = []
+    pending_masks: List[np.ndarray] = []
+    pending_meta: List[Dict] = []
+    masked_pool_pbar = tqdm(
+        total=(int(total_objects) if total_objects is not None and int(total_objects) > 0 else None),
+        desc="dino masked pool iters",
+        unit="obj",
+        dynamic_ncols=bool(getattr(sys.stderr, "isatty", lambda: False)()),
+    )
+
+    def flush() -> None:
+        nonlocal pending_tiles, pending_masks, pending_meta
+        if not pending_tiles:
+            return
+        x = torch.stack(pending_tiles, dim=0)
+        if int(adapter_input_size) > 0 and int(adapter_input_size) != int(x.shape[-1]):
+            x = F.interpolate(x, size=(int(adapter_input_size), int(adapter_input_size)), mode="bilinear", align_corners=False)
+        x = x.to(device)
+        with torch.inference_mode():
+            pred = model(x, return_features=True)
+            if feature_key not in pred:
+                raise RuntimeError(
+                    f"Feature key '{feature_key}' not returned by model. "
+                    f"Available keys: {sorted(list(pred.keys()))}"
+                )
+            fmap = pred[feature_key]
+            if fmap.ndim != 4:
+                raise RuntimeError(f"Expected 4D feature map for {feature_key}, got shape={tuple(fmap.shape)}")
+        for i in range(int(fmap.shape[0])):
+            v = masked_pool_from_tokens(fmap[i], pending_masks[i])
+            v = F.normalize(v, dim=0)
+            embeddings.append(v.detach().cpu().numpy().astype(np.float32))
+            metadata.append(pending_meta[i])
+            masked_pool_pbar.update(1)
+        pending_tiles = []
+        pending_masks = []
+        pending_meta = []
+
+    is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    tile_iter = tqdm(tiles, desc="tile stream", unit="tile", leave=False, dynamic_ncols=True) if is_tty else tiles
+    for t in tile_iter:
+        pending_tiles.append(t.tile_tensor)
+        pending_masks.append(t.mask_u8)
+        pending_meta.append(t.meta)
+        if len(pending_tiles) >= max(1, int(batch_size)):
+            flush()
+    flush()
+    masked_pool_pbar.close()
+
+    if not embeddings:
+        raise RuntimeError("No embeddings computed. Check --input-dir/--label-filter/--adapter-checkpoint.")
     return np.stack(embeddings, axis=0), metadata
 
 
@@ -309,6 +453,10 @@ def save_bank_artifacts(
             "min_poly_points": int(args.min_poly_points),
             "batch_size": int(args.batch_size),
             "load_workers": int(args.load_workers),
+            "feature_backend": str(args.feature_backend),
+            "adapter_checkpoint": str(args.adapter_checkpoint),
+            "adapter_feature_key": str(args.adapter_feature_key),
+            "adapter_input_size": int(args.adapter_input_size),
             "dino_model": str(args.dino_model),
             "device": str(args.device),
             "trust_torch_hub_repo": bool(args.trust_torch_hub_repo),
@@ -326,19 +474,39 @@ def main() -> None:
     args = parse_args()
     if not args.input_dir.exists():
         raise FileNotFoundError(f"Missing input dir: {args.input_dir}")
-    if str(args.dino_model).strip() != FIXED_DINO_MODEL:
+    if str(args.feature_backend) == "dino" and str(args.dino_model).strip() != FIXED_DINO_MODEL:
         print(f"forcing_dino_model={FIXED_DINO_MODEL} (requested={args.dino_model})")
         args.dino_model = FIXED_DINO_MODEL
 
     device = torch.device(args.device) if str(args.device).strip() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = [x.strip() for x in str(args.label_filter).split(",") if x.strip()]
+    if str(args.feature_backend) == "adapter":
+        adapter_ckpt_raw = str(args.adapter_checkpoint).strip()
+        if not adapter_ckpt_raw:
+            raise ValueError("--adapter-checkpoint is required when --feature-backend=adapter")
+        args.adapter_checkpoint = Path(adapter_ckpt_raw)
+        if not args.adapter_checkpoint.exists() or not args.adapter_checkpoint.is_file():
+            raise FileNotFoundError(f"Missing adapter checkpoint file: {args.adapter_checkpoint}")
+        if int(args.adapter_input_size) > 0 and (int(args.adapter_input_size) % 256) != 0:
+            raise ValueError("--adapter-input-size must be multiple of 256")
+        if int(args.adapter_input_size) <= 0 and (int(args.tile_size) % 256) != 0:
+            raise ValueError(
+                "Adapter backend requires model input size multiple of 256. "
+                "Set --tile-size to multiple of 256 or use --adapter-input-size."
+            )
 
     print(f"device={device}")
     print(f"input_dir={args.input_dir}")
     print(f"output_dir={args.output_dir}")
     print(f"labels={labels if labels else 'ALL'}")
     print(f"tile_size={args.tile_size} tile_context_scale={args.tile_context_scale}")
-    print(f"dino_model={args.dino_model}")
+    print(f"feature_backend={args.feature_backend}")
+    if str(args.feature_backend) == "adapter":
+        print(f"adapter_checkpoint={args.adapter_checkpoint}")
+        print(f"adapter_feature_key={args.adapter_feature_key}")
+        print(f"adapter_input_size={(int(args.adapter_input_size) if int(args.adapter_input_size) > 0 else 'tile_size')}")
+    else:
+        print(f"dino_model={args.dino_model}")
 
     tiles = iter_object_tiles(
         input_dir=args.input_dir,
@@ -349,14 +517,38 @@ def main() -> None:
         max_objects=int(args.max_objects),
         load_workers=int(args.load_workers),
     )
+    total_objects: Optional[int]
+    if int(args.max_objects) > 0:
+        total_objects = int(args.max_objects)
+    else:
+        total_objects = estimate_total_objects(
+            input_dir=args.input_dir,
+            label_filter=labels,
+            min_poly_points=int(args.min_poly_points),
+            max_objects=int(args.max_objects),
+            load_workers=int(args.load_workers),
+        )
+    print(f"total_objects_estimated={total_objects}")
 
-    embeddings, metadata = compute_bank(
-        tiles=tiles,
-        dino_model_name=str(args.dino_model),
-        device=device,
-        batch_size=int(args.batch_size),
-        trust_repo=bool(args.trust_torch_hub_repo),
-    )
+    if str(args.feature_backend) == "adapter":
+        embeddings, metadata = compute_bank_with_adapter(
+            tiles=tiles,
+            checkpoint=args.adapter_checkpoint,
+            device=device,
+            batch_size=int(args.batch_size),
+            feature_key=str(args.adapter_feature_key),
+            adapter_input_size=int(args.adapter_input_size),
+            total_objects=total_objects,
+        )
+    else:
+        embeddings, metadata = compute_bank(
+            tiles=tiles,
+            dino_model_name=str(args.dino_model),
+            device=device,
+            batch_size=int(args.batch_size),
+            trust_repo=bool(args.trust_torch_hub_repo),
+            total_objects=total_objects,
+        )
     print(f"objects={len(metadata)} embedding_dim={embeddings.shape[1]}")
 
     labels_arr, prototypes, proto_counts = build_label_prototypes(embeddings, metadata)

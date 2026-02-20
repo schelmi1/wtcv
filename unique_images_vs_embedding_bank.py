@@ -14,9 +14,10 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 import torchvision
+from tqdm.auto import tqdm
 from torchvision.transforms import functional as TF
 
-from build_embedding_bank import compute_bank, iter_object_tiles
+from build_embedding_bank import compute_bank, compute_bank_with_adapter, iter_object_tiles
 from wtcv_utils.labelme import shape_to_points
 from wtcv_utils.records import load_labelme_pairs
 
@@ -45,6 +46,32 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-objects", type=int, default=0, help="Optional cap on object extraction after scene selection")
     ap.add_argument("--batch-size", type=int, default=12)
     ap.add_argument("--bank-topk", type=int, default=5, help="Top-k bank matches used for mean score")
+    ap.add_argument(
+        "--feature-backend",
+        type=str,
+        choices=["dino", "adapter"],
+        default="dino",
+        help="Object embedding backend used for selected-scene object-vs-bank scoring.",
+    )
+    ap.add_argument(
+        "--adapter-checkpoint",
+        type=str,
+        default="",
+        help="Checkpoint path required when --feature-backend=adapter.",
+    )
+    ap.add_argument(
+        "--adapter-feature-key",
+        type=str,
+        choices=["feat_adapted", "feat_dino"],
+        default="feat_adapted",
+        help="Stage1 feature map to masked-pool in adapter backend.",
+    )
+    ap.add_argument(
+        "--adapter-input-size",
+        type=int,
+        default=0,
+        help="Optional square resize for adapter backend before forward (0 keeps tile_size). Must be multiple of 256.",
+    )
 
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
     ap.add_argument("--no-trust-torch-hub-repo", action="store_false", dest="trust_torch_hub_repo")
@@ -134,7 +161,7 @@ def _compute_scene_embeddings(
         pending_x = []
         pending_k = []
 
-    for p in image_paths:
+    for p in tqdm(image_paths, desc="scene dino embeds", unit="img"):
         ip = Path(str(p))
         if not ip.exists():
             continue
@@ -250,6 +277,24 @@ def main() -> None:
     print(f"input_dir={args.input_dir}")
     print(f"bank_npz={args.bank_npz}")
     print(f"labels={labels if labels else 'ALL'}")
+    print(f"feature_backend={args.feature_backend}")
+    if str(args.feature_backend) == "adapter":
+        adapter_ckpt_raw = str(args.adapter_checkpoint).strip()
+        if not adapter_ckpt_raw:
+            raise ValueError("--adapter-checkpoint is required when --feature-backend=adapter")
+        args.adapter_checkpoint = Path(adapter_ckpt_raw)
+        if not args.adapter_checkpoint.exists() or not args.adapter_checkpoint.is_file():
+            raise FileNotFoundError(f"Missing adapter checkpoint file: {args.adapter_checkpoint}")
+        if int(args.adapter_input_size) > 0 and (int(args.adapter_input_size) % 256) != 0:
+            raise ValueError("--adapter-input-size must be multiple of 256")
+        if int(args.adapter_input_size) <= 0 and (int(args.tile_size) % 256) != 0:
+            raise ValueError(
+                "Adapter backend requires model input size multiple of 256. "
+                "Set --tile-size to multiple of 256 or use --adapter-input-size."
+            )
+        print(f"adapter_checkpoint={args.adapter_checkpoint}")
+        print(f"adapter_feature_key={args.adapter_feature_key}")
+        print(f"adapter_input_size={(int(args.adapter_input_size) if int(args.adapter_input_size) > 0 else 'tile_size')}")
 
     candidates = _discover_candidate_images(
         input_dir=args.input_dir,
@@ -289,13 +334,25 @@ def main() -> None:
         max_objects=int(args.max_objects),
         load_workers=int(args.load_workers),
     )
-    obj_emb, obj_meta = compute_bank(
-        tiles=tiles,
-        dino_model_name=FIXED_DINO_MODEL,
-        device=device,
-        batch_size=int(args.batch_size),
-        trust_repo=bool(args.trust_torch_hub_repo),
-    )
+    if str(args.feature_backend) == "adapter":
+        obj_emb, obj_meta = compute_bank_with_adapter(
+            tiles=tiles,
+            checkpoint=args.adapter_checkpoint,
+            device=device,
+            batch_size=int(args.batch_size),
+            feature_key=str(args.adapter_feature_key),
+            adapter_input_size=int(args.adapter_input_size),
+            total_objects=(int(args.max_objects) if int(args.max_objects) > 0 else None),
+        )
+    else:
+        obj_emb, obj_meta = compute_bank(
+            tiles=tiles,
+            dino_model_name=FIXED_DINO_MODEL,
+            device=device,
+            batch_size=int(args.batch_size),
+            trust_repo=bool(args.trust_torch_hub_repo),
+            total_objects=(int(args.max_objects) if int(args.max_objects) > 0 else None),
+        )
     print(f"selected_objects={len(obj_meta)}")
 
     bank_blob = np.load(args.bank_npz)
@@ -395,6 +452,10 @@ def main() -> None:
         "input_dir": str(args.input_dir),
         "bank_npz": str(args.bank_npz),
         "dino_model": FIXED_DINO_MODEL,
+        "feature_backend": str(args.feature_backend),
+        "adapter_checkpoint": str(args.adapter_checkpoint),
+        "adapter_feature_key": str(args.adapter_feature_key),
+        "adapter_input_size": int(args.adapter_input_size),
         "candidate_images": int(len(image_paths)),
         "selected_unique_images": int(len(selected_images)),
         "selected_objects": int(len(object_rows)),

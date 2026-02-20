@@ -133,7 +133,8 @@ def build_object_crops(
         progress_desc="scan labelme",
         progress_leave=True,
     )
-    for pair in pairs:
+    pbar = tqdm(pairs, total=len(pairs), desc="build object crops")
+    for pair in pbar:
         jf = pair.json_path
         ip = pair.image_path
         d = pair.json_data
@@ -192,6 +193,8 @@ def build_object_crops(
                     crop_points=cpts,
                 )
             )
+            if (len(metas) % 100) == 0:
+                pbar.set_postfix(objects=len(metas))
             if max_objects > 0 and len(metas) >= max_objects:
                 return metas
     return metas
@@ -282,7 +285,10 @@ def add_to_fiftyone(
             raise RuntimeError(f"FiftyOne dataset already exists: {dataset_name}. Use --overwrite-dataset.")
 
     ds = fo.Dataset(dataset_name)
+    add_batch_size = 512
     samples: List[fo.Sample] = []
+    pbar_build = tqdm(total=len(metas), desc="fiftyone sample build")
+    pbar_add = tqdm(total=len(metas), desc="fiftyone add_samples")
     for i, m in enumerate(metas):
         cp = Image.open(m.crop_path)
         cw, ch = cp.size
@@ -319,8 +325,19 @@ def add_to_fiftyone(
         s["umap"] = umap_xy[i].astype(np.float32).tolist()
         s["cluster"] = int(cluster_ids[i])
         samples.append(s)
+        pbar_build.update(1)
 
-    ds.add_samples(samples)
+        if len(samples) >= add_batch_size:
+            ds.add_samples(samples)
+            pbar_add.update(len(samples))
+            samples = []
+
+    if len(samples) > 0:
+        ds.add_samples(samples)
+        pbar_add.update(len(samples))
+    pbar_build.close()
+    pbar_add.close()
+
     ds.persistent = True
     print(f"fiftyone_dataset={ds.name} samples={len(ds)}")
     return ds
@@ -376,6 +393,7 @@ def main() -> None:
         raise RuntimeError("No valid objects found from LabelMe pairs")
     print(f"objects={len(metas)}")
 
+    print("stage=compute_embeddings")
     emb = compute_embeddings(
         metas=metas,
         dino_model_name=str(args.dino_model),
@@ -384,6 +402,7 @@ def main() -> None:
         trust_repo=bool(args.trust_torch_hub_repo),
     )
 
+    print("stage=umap_fit_transform")
     reducer = umap.UMAP(
         n_neighbors=max(2, int(args.umap_n_neighbors)),
         min_dist=float(args.umap_min_dist),
@@ -391,6 +410,7 @@ def main() -> None:
         random_state=int(args.seed),
     )
     um = reducer.fit_transform(emb)
+    print("stage=kmeans_fit_predict")
     k = max(2, int(args.num_clusters))
     if len(metas) < k:
         k = max(2, min(len(metas), 8))
