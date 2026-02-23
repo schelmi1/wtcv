@@ -35,6 +35,17 @@ def run_pretraining(
     dino_weight: float,
     ibot_weight: float,
     ibot_mask_ratio: float,
+    koleo_weight: float,
+    pretrain_mode: str,
+    upscale_type: str,
+    edge_consistency_weight: float,
+    semantic_smooth_weight: float,
+    semantic_smooth_tau: float,
+    upscale_gate_init: float,
+    upscale_local_gain: float,
+    upscale_dino_gain: float,
+    upscale_refine_gain: float,
+    upscale_sharpen_gain: float,
     lora_rank: int,
     lora_alpha: float,
     lora_dropout: float,
@@ -101,6 +112,28 @@ def run_pretraining(
         str(float(ibot_weight)),
         "--ibot-mask-ratio",
         str(float(ibot_mask_ratio)),
+        "--koleo-weight",
+        str(float(koleo_weight)),
+        "--pretrain-mode",
+        str(pretrain_mode),
+        "--upscale-type",
+        str(upscale_type),
+        "--edge-consistency-weight",
+        str(float(edge_consistency_weight)),
+        "--semantic-smooth-weight",
+        str(float(semantic_smooth_weight)),
+        "--semantic-smooth-tau",
+        str(float(semantic_smooth_tau)),
+        "--upscale-gate-init",
+        str(float(upscale_gate_init)),
+        "--upscale-local-gain",
+        str(float(upscale_local_gain)),
+        "--upscale-dino-gain",
+        str(float(upscale_dino_gain)),
+        "--upscale-refine-gain",
+        str(float(upscale_refine_gain)),
+        "--upscale-sharpen-gain",
+        str(float(upscale_sharpen_gain)),
         "--lora-rank",
         str(int(lora_rank)),
         "--lora-alpha",
@@ -139,8 +172,8 @@ def build_tab(root: Path, nested: bool = False) -> None:
 
     with container(**container_kwargs):
         gr.Markdown(
-            "LoRA-based self-supervised DINO/iBOT-style pretraining. "
-            "Student backbone gets LoRA adapters, teacher is EMA-updated."
+            "Self-supervised DINO/iBOT-style pretraining with selectable adaptation mode "
+            "(LoRA or Stage1-style token upscaling)."
         )
         with gr.Row():
             input_dir = gr.Textbox(value=str(root / "data"), label="Input Image Dir(s)", info="Recursive image scan root(s) for unlabeled pretraining frames. Supports comma-separated directories.")
@@ -174,23 +207,89 @@ def build_tab(root: Path, nested: bool = False) -> None:
         with gr.Row():
             teacher_temp = gr.Number(value=0.04, label="Teacher Temp")
             student_temp = gr.Number(value=0.1, label="Student Temp")
-            dino_weight = gr.Number(value=1.0, label="DINO Loss Weight")
-            ibot_weight = gr.Number(value=1.0, label="iBOT Loss Weight")
-            ibot_mask_ratio = gr.Number(value=0.3, label="iBOT Mask Ratio")
+            dino_weight = gr.Number(value=1.0, label="DINO Loss Weight", info="Weight for global-view DINO alignment loss.")
+            ibot_weight = gr.Number(value=1.0, label="iBOT Loss Weight", info="Weight for masked token prediction loss.")
+            ibot_mask_ratio = gr.Number(value=0.3, label="iBOT Mask Ratio", info="Fraction of tokens masked for iBOT patch objective.")
+            koleo_weight = gr.Number(value=0.0, label="KoLeo Weight", info="Uniformity regularizer on student global CLS features.")
         with gr.Row():
-            lora_rank = gr.Number(value=8, precision=0, label="LoRA Rank")
-            lora_alpha = gr.Number(value=16.0, label="LoRA Alpha")
-            lora_dropout = gr.Number(value=0.0, label="LoRA Dropout")
-            lora_targets = gr.Textbox(value="attn.qkv,attn.proj", label="LoRA Targets")
             head_only_warmup_epochs = gr.Number(value=1, precision=0, label="Head-only Warmup Epochs")
             warmup_use_vanilla_backbone = gr.Dropdown(choices=["on", "off"], value="on", label="Warmup uses vanilla DINO")
+        with gr.Row():
+            pretrain_mode = gr.Dropdown(
+                choices=["lora", "upscaling"],
+                value="lora",
+                label="Pretrain Mode",
+                info="Choose backbone adaptation strategy for SSL pretraining.",
+            )
+        with gr.Row(visible=False) as upscaling_row:
+            upscale_type = gr.Dropdown(
+                choices=["learned", "pixelshuffle"],
+                value="learned",
+                label="Upscaling Type",
+                info="Upsampler for DINO token map before fusion with local CNN features.",
+            )
+            edge_consistency_weight = gr.Number(
+                value=0.05,
+                label="Edge Consistency Weight",
+                info="Encourages fused features to preserve local-branch edge structure.",
+            )
+            semantic_smooth_weight = gr.Number(
+                value=0.0,
+                label="Semantic Smooth Weight",
+                info="Smooths adapted token map within semantically similar DINO neighborhoods.",
+            )
+            semantic_smooth_tau = gr.Number(
+                value=0.2,
+                label="Semantic Smooth Tau",
+                info="Affinity temperature for semantic smoothing (lower = sharper affinity).",
+            )
+            upscale_gate_init = gr.Number(
+                value=0.0,
+                label="Upscale Gate Init",
+                info="Initial pre-sigmoid value of learned DINO-branch fusion gate.",
+            )
+            upscale_local_gain = gr.Number(
+                value=1.0,
+                label="Upscale Local Gain",
+                info="Fixed multiplier for local CNN branch in fusion.",
+            )
+            upscale_dino_gain = gr.Number(
+                value=1.0,
+                label="Upscale DINO Gain",
+                info="Fixed multiplier for DINO upsample branch before learned gate.",
+            )
+            upscale_refine_gain = gr.Number(
+                value=1.0,
+                label="Upscale Refine Gain",
+                info="Residual strength of post-fusion refine conv block.",
+            )
+            upscale_sharpen_gain = gr.Number(
+                value=0.0,
+                label="Upscale Sharpen Gain",
+                info="Unsharp-mask gain on fused feature map (0 disables sharpening).",
+            )
+        with gr.Row() as lora_row:
+            lora_rank = gr.Number(value=8, precision=0, label="LoRA Rank", info="Low-rank adapter size per targeted linear layer.")
+            lora_alpha = gr.Number(value=16.0, label="LoRA Alpha", info="LoRA scaling factor (effective strength is alpha/rank).")
+            lora_dropout = gr.Number(value=0.0, label="LoRA Dropout", info="Dropout inside LoRA branch.")
+            lora_targets = gr.Textbox(value="attn.qkv,attn.proj", label="LoRA Targets", info="Comma-separated module name substrings to inject LoRA into.")
         with gr.Row():
             device = gr.Textbox(value="", label="Device (blank=auto)")
             trust_torch_hub_repo = gr.Dropdown(choices=["on", "off"], value="on", label="Trust torch.hub repo")
 
-        btn = gr.Button("Run LoRA SSL Pretraining", variant="primary")
+        btn = gr.Button("Run SSL Pretraining", variant="primary")
         cmd_out = gr.Textbox(label="Command", interactive=False)
         logs = gr.Textbox(label="Live Logs", lines=22, elem_classes=["mono"], interactive=False)
+
+        def _on_mode_change(mode: str):
+            is_lora = str(mode).strip().lower() == "lora"
+            return gr.update(visible=is_lora), gr.update(visible=(not is_lora))
+
+        pretrain_mode.change(
+            fn=_on_mode_change,
+            inputs=[pretrain_mode],
+            outputs=[lora_row, upscaling_row],
+        )
 
         btn.click(
             fn=run_pretraining,
@@ -220,6 +319,17 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 dino_weight,
                 ibot_weight,
                 ibot_mask_ratio,
+                koleo_weight,
+                pretrain_mode,
+                upscale_type,
+                edge_consistency_weight,
+                semantic_smooth_weight,
+                semantic_smooth_tau,
+                upscale_gate_init,
+                upscale_local_gain,
+                upscale_dino_gain,
+                upscale_refine_gain,
+                upscale_sharpen_gain,
                 lora_rank,
                 lora_alpha,
                 lora_dropout,
