@@ -16,9 +16,11 @@ from wtcv_app.tabs.dataset_vs_bank_tab import build_tab as build_dataset_vs_bank
 from wtcv_app.tabs.dataset_peek_tab import build_tab as build_dataset_peek_tab
 from wtcv_app.tabs.embedding_bank_tab import build_tab as build_embedding_bank_tab
 from wtcv_app.tabs.eval_tab import build_tab as build_eval_tab
+from wtcv_app.tabs.experimental_tab import build_tab as build_experimental_tab
 from wtcv_app.tabs.live_screen_tab import build_tab as build_live_screen_tab
 from wtcv_app.tabs.media_source_tab import build_tab as build_media_source_tab
 from wtcv_app.tabs.object_umap_tab import build_tab as build_object_umap_tab
+from wtcv_app.tabs.pretraining_tab import build_tab as build_pretraining_tab
 from wtcv_app.tabs.sam_tab import build_tab as build_sam_tab
 from wtcv_app.tabs.sam2_tab import build_tab as build_sam2_tab
 from wtcv_app.tabs.single_image_tab import build_tab as build_single_image_tab
@@ -176,6 +178,8 @@ def make_app() -> gr.Blocks:
 
         with gr.Tabs():
             build_train_tab(ROOT)
+            with gr.Tab("Pretraining"):
+                build_pretraining_tab(ROOT, nested=True)
             build_eval_tab(ROOT)
             with gr.Tab("Refinement"):
                 with gr.Tabs():
@@ -199,6 +203,10 @@ def make_app() -> gr.Blocks:
                         build_dataset_vs_bank_tab(ROOT, nested=True)
             build_embedding_bank_tab(ROOT)
             build_object_umap_tab(ROOT)
+            with gr.Tab("Experimental"):
+                with gr.Tabs():
+                    with gr.Tab("Random Detect + Caption"):
+                        build_experimental_tab(ROOT, nested=True)
             with gr.Tab("Media Inference"):
                 with gr.Tabs():
                     with gr.Tab("Batched Image Inference"):

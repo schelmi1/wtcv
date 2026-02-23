@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -41,7 +43,22 @@ except Exception as e:  # pragma: no cover
 from wtcv_utils.labelme import polygon_area, polygon_bbox, shape_to_points
 from wtcv_utils.records import load_labelme_pairs
 
-FIXED_DINO_MODEL = "dinov2_vits14_reg"
+DEFAULT_DINO_MODEL = "dinov2_vits14_reg"
+DEFAULT_SAM1_MODEL = "facebook/sam-vit-base"
+DEFAULT_SAM2_MODEL = "facebook/sam2-hiera-tiny"
+
+
+def _infer_backend_from_backbone_model(model_name: str) -> Optional[str]:
+    m = str(model_name).strip().lower()
+    if not m:
+        return None
+    if "sam2" in m or "hiera" in m:
+        return "sam2"
+    if "/sam-" in m or m.startswith("sam-") or m.startswith("facebook/sam"):
+        return "sam1"
+    if "dinov2" in m:
+        return "dino"
+    return None
 
 
 @dataclass
@@ -60,6 +77,80 @@ class ObjMeta:
     crop_points: List[List[float]]
 
 
+def _build_crops_for_pair(
+    pair_idx: int,
+    image_path: str,
+    json_path: str,
+    json_data: Dict,
+    label_set: Sequence[str],
+    tile_size: int,
+    tile_context_scale: float,
+    min_poly_points: int,
+    crops_dir: str,
+) -> List[Dict]:
+    ip = Path(image_path)
+    jf = Path(json_path)
+    try:
+        img = np.array(Image.open(ip).convert("RGB"), dtype=np.uint8)
+    except Exception:
+        return []
+
+    h, w = img.shape[:2]
+    img_area = float(max(1, w * h))
+    out: List[Dict] = []
+    shapes = json_data.get("shapes", []) or []
+    label_set_cf = {str(x).strip().casefold() for x in label_set if str(x).strip()}
+    crops_root = Path(crops_dir)
+
+    for sidx, s in enumerate(shapes):
+        lab = str(s.get("label", "")).strip()
+        lab_cf = lab.casefold()
+        if label_set_cf and (lab_cf not in label_set_cf):
+            continue
+        pts = shape_to_points(s, min_poly_points=min_poly_points)
+        if pts is None:
+            continue
+        x0, y0, x1, y1 = polygon_bbox(pts)
+        bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
+        side = int(max(16.0, np.ceil(max(bw, bh) * float(tile_context_scale))))
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        tx0 = int(round(cx - 0.5 * side))
+        ty0 = int(round(cy - 0.5 * side))
+
+        crop = square_crop_with_pad(img, tx0, ty0, side)
+        interp = Image.BILINEAR
+        crop_pil = Image.fromarray(crop).resize((tile_size, tile_size), interp)
+        crop_np = np.array(crop_pil, dtype=np.uint8)
+
+        sx = float(tile_size) / float(side)
+        sy = float(tile_size) / float(side)
+        cpts = [[(float(p[0]) - float(tx0)) * sx, (float(p[1]) - float(ty0)) * sy] for p in pts]
+        cpts = [[max(0.0, min(float(tile_size - 1), p[0])), max(0.0, min(float(tile_size - 1), p[1]))] for p in cpts]
+
+        stem = f"{pair_idx:06d}_{ip.stem}__obj{sidx:04d}"
+        crop_path = crops_root / f"{stem}.jpg"
+        Image.fromarray(crop_np).save(crop_path, quality=95)
+
+        out.append(
+            {
+                "source_image": str(ip),
+                "source_json": str(jf),
+                "source_label": lab if lab else "unknown",
+                "source_label_cf": lab_cf if lab else "unknown",
+                "source_obj_idx": int(sidx),
+                "image_w": int(w),
+                "image_h": int(h),
+                "points": pts,
+                "bbox_xyxy": [float(x0), float(y0), float(x1), float(y1)],
+                "area_ratio": float(max(0.0, polygon_area(pts)) / img_area),
+                "crop_path": str(crop_path),
+                "crop_points": cpts,
+            }
+        )
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Build object-level FiftyOne dataset with DINO mask-pooled embeddings + UMAP clustering")
     ap.add_argument("--input-dir", type=Path, required=True, help="LabelMe image/json pairs")
@@ -73,9 +164,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-poly-points", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=12)
     ap.add_argument(
+        "--crop-workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) // 2),
+        help="Parallel workers for object crop building (default: CPU/2, min 1).",
+    )
+    ap.add_argument(
         "--feature-backend",
         type=str,
-        choices=["auto", "dino", "adapter"],
+        choices=["auto", "dino", "adapter", "sam1", "sam2"],
         default="auto",
         help="Feature extractor backend. auto=adapter when checkpoint provided, else dino.",
     )
@@ -99,7 +196,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional square resize before adapter forward (0 keeps tile_size). Must be multiple of 256.",
     )
 
-    ap.add_argument("--dino-model", type=str, default=FIXED_DINO_MODEL)
+    ap.add_argument("--dino-model", type=str, default=DEFAULT_DINO_MODEL)
+    ap.add_argument(
+        "--backbone-model",
+        type=str,
+        default="",
+        help=(
+            "Optional explicit backbone model string. For dino backend: torch.hub model "
+            "(e.g. dinov2_vits14_reg, dinov2_vitb14). For sam1/sam2: Hugging Face model id "
+            "(e.g. facebook/sam-vit-base, facebook/sam2-hiera-tiny)."
+        ),
+    )
     ap.add_argument("--trust-torch-hub-repo", action="store_true", default=True)
     ap.add_argument("--no-trust-torch-hub-repo", action="store_false", dest="trust_torch_hub_repo")
     ap.add_argument("--device", type=str, default="", help="cuda|cpu; default auto")
@@ -149,6 +256,7 @@ def build_object_crops(
     tile_context_scale: float,
     min_poly_points: int,
     max_objects: int,
+    crop_workers: int,
 ) -> List[ObjMeta]:
     output_dir.mkdir(parents=True, exist_ok=True)
     crops_dir = output_dir / "crops"
@@ -162,70 +270,82 @@ def build_object_crops(
         progress_desc="scan labelme",
         progress_leave=True,
     )
-    pbar = tqdm(pairs, total=len(pairs), desc="build object crops")
-    for pair in pbar:
-        jf = pair.json_path
-        ip = pair.image_path
-        d = pair.json_data
-
-        try:
-            img = np.array(Image.open(ip).convert("RGB"), dtype=np.uint8)
-        except Exception:
-            continue
-        h, w = img.shape[:2]
-        img_area = float(max(1, w * h))
-
-        shapes = d.get("shapes", []) or []
-        for sidx, s in enumerate(shapes):
-            lab = str(s.get("label", "")).strip()
-            lab_cf = lab.casefold()
-            if label_set and (lab_cf not in label_set):
-                continue
-            pts = shape_to_points(s, min_poly_points=min_poly_points)
-            if pts is None:
-                continue
-            x0, y0, x1, y1 = polygon_bbox(pts)
-            bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
-            side = int(max(16.0, np.ceil(max(bw, bh) * float(tile_context_scale))))
-            cx = 0.5 * (x0 + x1)
-            cy = 0.5 * (y0 + y1)
-            tx0 = int(round(cx - 0.5 * side))
-            ty0 = int(round(cy - 0.5 * side))
-
-            crop = square_crop_with_pad(img, tx0, ty0, side)
-            interp = Image.BILINEAR
-            crop_pil = Image.fromarray(crop).resize((tile_size, tile_size), interp)
-            crop_np = np.array(crop_pil, dtype=np.uint8)
-
-            sx = float(tile_size) / float(side)
-            sy = float(tile_size) / float(side)
-            cpts = [[(float(p[0]) - float(tx0)) * sx, (float(p[1]) - float(ty0)) * sy] for p in pts]
-            cpts = [[max(0.0, min(float(tile_size - 1), p[0])), max(0.0, min(float(tile_size - 1), p[1]))] for p in cpts]
-
-            stem = f"{ip.stem}__obj{sidx:04d}"
-            crop_path = crops_dir / f"{stem}.jpg"
-            Image.fromarray(crop_np).save(crop_path, quality=95)
-
-            metas.append(
-                ObjMeta(
-                    source_image=ip,
-                    source_json=jf,
-                    source_label=lab if lab else "unknown",
-                    source_label_cf=lab_cf if lab else "unknown",
-                    source_obj_idx=int(sidx),
-                    image_w=int(w),
-                    image_h=int(h),
-                    points=pts,
-                    bbox_xyxy=(x0, y0, x1, y1),
-                    area_ratio=float(max(0.0, polygon_area(pts)) / img_area),
-                    crop_path=crop_path,
-                    crop_points=cpts,
+    tasks = [
+        (
+            i,
+            str(pair.image_path),
+            str(pair.json_path),
+            pair.json_data,
+            tuple(label_set),
+            int(tile_size),
+            float(tile_context_scale),
+            int(min_poly_points),
+            str(crops_dir),
+        )
+        for i, pair in enumerate(pairs)
+    ]
+    if len(tasks) == 0:
+        return metas
+    workers = int(crop_workers)
+    if workers <= 0:
+        workers = max(1, (os.cpu_count() or 2) // 2)
+    workers = max(1, workers)
+    pbar = tqdm(total=len(tasks), desc="build object crops")
+    if workers == 1:
+        for t in tasks:
+            rows = _build_crops_for_pair(*t)
+            for r in rows:
+                metas.append(
+                    ObjMeta(
+                        source_image=Path(r["source_image"]),
+                        source_json=Path(r["source_json"]),
+                        source_label=str(r["source_label"]),
+                        source_label_cf=str(r["source_label_cf"]),
+                        source_obj_idx=int(r["source_obj_idx"]),
+                        image_w=int(r["image_w"]),
+                        image_h=int(r["image_h"]),
+                        points=r["points"],
+                        bbox_xyxy=tuple(r["bbox_xyxy"]),
+                        area_ratio=float(r["area_ratio"]),
+                        crop_path=Path(r["crop_path"]),
+                        crop_points=r["crop_points"],
+                    )
                 )
-            )
+            pbar.update(1)
             if (len(metas) % 100) == 0:
                 pbar.set_postfix(objects=len(metas))
             if max_objects > 0 and len(metas) >= max_objects:
-                return metas
+                pbar.close()
+                return metas[: int(max_objects)]
+    else:
+        t_cols = list(zip(*tasks))
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for rows in ex.map(_build_crops_for_pair, *t_cols, chunksize=8):
+                for r in rows:
+                    metas.append(
+                        ObjMeta(
+                            source_image=Path(r["source_image"]),
+                            source_json=Path(r["source_json"]),
+                            source_label=str(r["source_label"]),
+                            source_label_cf=str(r["source_label_cf"]),
+                            source_obj_idx=int(r["source_obj_idx"]),
+                            image_w=int(r["image_w"]),
+                            image_h=int(r["image_h"]),
+                            points=r["points"],
+                            bbox_xyxy=tuple(r["bbox_xyxy"]),
+                            area_ratio=float(r["area_ratio"]),
+                            crop_path=Path(r["crop_path"]),
+                            crop_points=r["crop_points"],
+                        )
+                    )
+                pbar.update(1)
+                if (len(metas) % 100) == 0:
+                    pbar.set_postfix(objects=len(metas))
+                if max_objects > 0 and len(metas) >= max_objects:
+                    break
+    pbar.close()
+    if max_objects > 0:
+        return metas[: int(max_objects)]
     return metas
 
 
@@ -290,6 +410,130 @@ def compute_embeddings_dino(
         pending_x.append(x)
         pending_masks.append(mask)
         if len(pending_x) >= max(1, int(batch_size)):
+            flush()
+    flush()
+
+    if len(embs) == 0:
+        raise RuntimeError("No embeddings computed")
+    return np.stack(embs, axis=0)
+
+
+def compute_embeddings_sam(
+    metas: List[ObjMeta],
+    backend: str,
+    model_name: str,
+    device: torch.device,
+    batch_size: int,
+    tile_size: int,
+) -> np.ndarray:
+    backend = str(backend).strip().lower()
+    if backend == "sam1":
+        from transformers import SamModel, SamProcessor
+
+        processor = SamProcessor.from_pretrained(model_name)
+        model = SamModel.from_pretrained(model_name).to(device).eval()
+    elif backend == "sam2":
+        from transformers import Sam2Model, Sam2Processor
+
+        processor = Sam2Processor.from_pretrained(model_name)
+        model = Sam2Model.from_pretrained(model_name).to(device).eval()
+    else:
+        raise ValueError(f"Unsupported SAM backend: {backend}")
+
+    for p in model.parameters():
+        p.requires_grad = False
+    if backend == "sam2":
+        print(f"sam2_forced_input_size={int(tile_size)}x{int(tile_size)}")
+    elif backend == "sam1":
+        print("sam1_forced_input_size=1024x1024 (model constraint)")
+
+    embs: List[np.ndarray] = []
+    pending_images: List[np.ndarray] = []
+    pending_masks: List[np.ndarray] = []
+
+    def _pick_feature_map(raw_embeddings: object) -> torch.Tensor:
+        if isinstance(raw_embeddings, torch.Tensor):
+            if raw_embeddings.ndim != 4:
+                raise RuntimeError(f"SAM image embedding tensor must be 4D, got shape={tuple(raw_embeddings.shape)}")
+            return raw_embeddings
+        if isinstance(raw_embeddings, (list, tuple)):
+            cands: List[torch.Tensor] = []
+            for x in raw_embeddings:
+                if isinstance(x, torch.Tensor) and x.ndim == 4:
+                    cands.append(x)
+            if not cands:
+                raise RuntimeError("SAM returned list/tuple embeddings but no 4D tensor feature maps were found")
+            # Prefer the highest spatial resolution map for object-level masked pooling.
+            cands.sort(key=lambda t: int(t.shape[-2]) * int(t.shape[-1]), reverse=True)
+            return cands[0]
+        raise RuntimeError(f"Unsupported SAM image embedding type: {type(raw_embeddings)}")
+
+    def _run_model_batch(images_batch: List[np.ndarray], masks_batch: List[np.ndarray]) -> None:
+        if backend == "sam2":
+            inputs = processor(
+                images=images_batch,
+                do_resize=True,
+                size={"height": int(tile_size), "width": int(tile_size)},
+                mask_size={"height": int(tile_size), "width": int(tile_size)},
+                return_tensors="pt",
+            )
+        elif backend == "sam1":
+            # SAM1 image encoder is configured for 1024x1024; keep processor defaults.
+            inputs = processor(images=images_batch, return_tensors="pt")
+        else:
+            inputs = processor(images=images_batch, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device)
+        with torch.inference_mode():
+            try:
+                raw = model.get_image_embeddings(pixel_values=pixel_values)
+            except RuntimeError as e:
+                if backend == "sam2" and "view size is not compatible" in str(e):
+                    # Workaround for transformers SAM2 get_image_embeddings using view() on non-contiguous tensors.
+                    image_outputs = model.get_image_features(pixel_values, return_dict=True)
+                    feature_maps = list(image_outputs.fpn_hidden_states)
+                    if len(feature_maps) == 0:
+                        raise RuntimeError("SAM2 fallback: empty feature maps from get_image_features") from e
+                    feature_maps[-1] = feature_maps[-1] + model.no_memory_embedding
+                    raw = []
+                    for feat, feat_size in zip(feature_maps, model.backbone_feature_sizes):
+                        t = feat.permute(1, 2, 0).contiguous().reshape(pixel_values.shape[0], -1, *feat_size)
+                        raw.append(t)
+                else:
+                    raise
+            fmap = _pick_feature_map(raw)
+        for i in range(int(fmap.shape[0])):
+            v = masked_pool_from_tokens(fmap[i], masks_batch[i])
+            v = F.normalize(v, dim=0)
+            embs.append(v.detach().cpu().numpy().astype(np.float32))
+
+    def _run_with_oom_split(images_batch: List[np.ndarray], masks_batch: List[np.ndarray]) -> None:
+        try:
+            _run_model_batch(images_batch, masks_batch)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            is_oom = ("out of memory" in msg) or ("cuda out of memory" in msg)
+            if (not is_oom) or len(images_batch) <= 1:
+                raise
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            mid = len(images_batch) // 2
+            _run_with_oom_split(images_batch[:mid], masks_batch[:mid])
+            _run_with_oom_split(images_batch[mid:], masks_batch[mid:])
+
+    def flush() -> None:
+        nonlocal pending_images, pending_masks
+        if len(pending_images) == 0:
+            return
+        _run_with_oom_split(pending_images, pending_masks)
+        pending_images = []
+        pending_masks = []
+
+    for m in tqdm(metas, desc=f"{backend} masked pool"):
+        img = np.array(Image.open(m.crop_path).convert("RGB"), dtype=np.uint8)
+        mask = polygon_mask(m.crop_points, w=img.shape[1], h=img.shape[0])
+        pending_images.append(img)
+        pending_masks.append(mask)
+        if len(pending_images) >= max(1, int(batch_size)):
             flush()
     flush()
 
@@ -469,6 +713,20 @@ def main() -> None:
         feature_backend = "adapter" if adapter_ckpt_raw else "dino"
     else:
         feature_backend = requested_backend
+    backbone_model_raw = str(args.backbone_model).strip()
+    inferred_backend = _infer_backend_from_backbone_model(backbone_model_raw)
+    if inferred_backend in {"sam1", "sam2"} and requested_backend == "auto":
+        feature_backend = inferred_backend
+    if inferred_backend in {"sam1", "sam2"} and feature_backend == "dino":
+        raise ValueError(
+            f"--feature-backend=dino is incompatible with --backbone-model={backbone_model_raw!r}. "
+            f"Use --feature-backend={inferred_backend} (or auto) for SAM model ids."
+        )
+    if inferred_backend == "dino" and feature_backend in {"sam1", "sam2"}:
+        raise ValueError(
+            f"--feature-backend={feature_backend} is incompatible with DINO backbone model {backbone_model_raw!r}. "
+            "Choose a SAM model id for SAM backends, or switch backend to dino."
+        )
 
     adapter_checkpoint: Optional[Path] = None
     if feature_backend == "adapter":
@@ -484,10 +742,17 @@ def main() -> None:
                 "Adapter backend requires model input size multiple of 256. "
                 "Set --tile-size to multiple of 256 or use --adapter-input-size."
             )
+
+    if feature_backend == "dino":
+        dino_model_name = backbone_model_raw if backbone_model_raw else str(args.dino_model).strip()
     else:
-        if str(args.dino_model).strip() != FIXED_DINO_MODEL:
-            print(f"forcing_dino_model={FIXED_DINO_MODEL} (requested={args.dino_model})")
-            args.dino_model = FIXED_DINO_MODEL
+        dino_model_name = str(args.dino_model).strip()
+    if feature_backend == "sam1":
+        sam_model_name = backbone_model_raw if backbone_model_raw else DEFAULT_SAM1_MODEL
+    elif feature_backend == "sam2":
+        sam_model_name = backbone_model_raw if backbone_model_raw else DEFAULT_SAM2_MODEL
+    else:
+        sam_model_name = ""
 
     device = torch.device(args.device) if str(args.device).strip() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = [x.strip() for x in str(args.label_filter).split(",") if x.strip()]
@@ -496,13 +761,16 @@ def main() -> None:
     print(f"input_dir={args.input_dir}")
     print(f"labels={labels if labels else 'ALL'}")
     print(f"tile_size={args.tile_size} tile_context_scale={args.tile_context_scale}")
+    print(f"crop_workers={int(args.crop_workers)}")
     print(f"feature_backend={feature_backend}")
     if feature_backend == "adapter":
         print(f"adapter_checkpoint={adapter_checkpoint}")
         print(f"adapter_feature_key={args.adapter_feature_key}")
         print(f"adapter_input_size={(int(args.adapter_input_size) if int(args.adapter_input_size) > 0 else 'tile_size')}")
-    else:
-        print(f"dino_model={args.dino_model}")
+    elif feature_backend == "dino":
+        print(f"dino_model={dino_model_name}")
+    elif feature_backend in {"sam1", "sam2"}:
+        print(f"sam_model={sam_model_name}")
     print(f"run_kmeans={bool(args.run_kmeans)}")
     if bool(args.run_kmeans):
         print(f"num_clusters={int(args.num_clusters)}")
@@ -515,6 +783,7 @@ def main() -> None:
         tile_context_scale=float(args.tile_context_scale),
         min_poly_points=int(args.min_poly_points),
         max_objects=int(args.max_objects),
+        crop_workers=int(args.crop_workers),
     )
     if len(metas) == 0:
         raise RuntimeError("No valid objects found from LabelMe pairs")
@@ -530,14 +799,25 @@ def main() -> None:
             feature_key=str(args.adapter_feature_key),
             adapter_input_size=int(args.adapter_input_size),
         )
-    else:
+    elif feature_backend == "dino":
         emb = compute_embeddings_dino(
             metas=metas,
-            dino_model_name=str(args.dino_model),
+            dino_model_name=dino_model_name,
             device=device,
             batch_size=int(args.batch_size),
             trust_repo=bool(args.trust_torch_hub_repo),
         )
+    elif feature_backend in {"sam1", "sam2"}:
+        emb = compute_embeddings_sam(
+            metas=metas,
+            backend=feature_backend,
+            model_name=sam_model_name,
+            device=device,
+            batch_size=int(args.batch_size),
+            tile_size=int(args.tile_size),
+        )
+    else:
+        raise ValueError(f"Unsupported feature backend: {feature_backend}")
 
     print("stage=umap_fit_transform")
     reducer = umap.UMAP(

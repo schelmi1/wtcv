@@ -17,8 +17,10 @@ def run_object_umap(
     max_objects: int,
     tile_size: int,
     tile_context_scale: float,
+    crop_workers: int,
     batch_size: int,
     feature_backend: str,
+    backbone_model: str,
     adapter_checkpoint: str,
     adapter_feature_key: str,
     adapter_input_size: int,
@@ -54,10 +56,14 @@ def run_object_umap(
         str(int(tile_size)),
         "--tile-context-scale",
         str(float(tile_context_scale)),
+        "--crop-workers",
+        str(int(crop_workers)),
         "--batch-size",
         str(int(batch_size)),
         "--feature-backend",
         str(feature_backend),
+        "--backbone-model",
+        str(backbone_model),
         "--adapter-feature-key",
         str(adapter_feature_key),
         "--adapter-input-size",
@@ -121,13 +127,28 @@ def build_tab(root: Path) -> None:
             fo_max_objects = gr.Number(value=0, precision=0, label="Max Objects (0=all)", info="Maximum number of objects to include; 0 means all objects.")
             fo_tile_size = gr.Number(value=448, precision=0, label="Tile Size", info="Side length of each square inference/training tile in pixels.")
             fo_context = gr.Number(value=2.0, label="Tile Context Scale", info="Object crop context multiplier relative to object bbox size.")
+            fo_crop_workers = gr.Number(value=0, precision=0, label="Crop Workers (0=CPU/2)", info="Parallel workers used for object crop build stage.")
             fo_batch = gr.Number(value=12, precision=0, label="DINO Batch Size", info="Batch size used while extracting DINO embeddings.")
         with gr.Row():
             fo_feature_backend = gr.Dropdown(
-                choices=["auto", "dino", "adapter"],
+                choices=["auto", "dino", "adapter", "sam1", "sam2"],
                 value="auto",
                 label="Feature Backend",
                 info="auto uses adapter only when a checkpoint is provided; otherwise raw DINO.",
+            )
+            fo_backbone_model = gr.Dropdown(
+                choices=[
+                    "",
+                    "dinov2_vits14_reg",
+                    "dinov2_vits14",
+                    "dinov2_vitb14_reg",
+                    "dinov2_vitb14",
+                    "facebook/sam-vit-base",
+                    "facebook/sam2-hiera-tiny",
+                ],
+                value="",
+                label="Backbone Model (optional override)",
+                info="Set explicit backbone model for dino/sam backends. Leave blank for backend defaults.",
             )
             fo_adapter_ckpt = gr.Textbox(
                 value="",
@@ -176,8 +197,10 @@ def build_tab(root: Path) -> None:
                 fo_max_objects,
                 fo_tile_size,
                 fo_context,
+                fo_crop_workers,
                 fo_batch,
                 fo_feature_backend,
+                fo_backbone_model,
                 fo_adapter_ckpt,
                 fo_adapter_feature_key,
                 fo_adapter_input_size,
