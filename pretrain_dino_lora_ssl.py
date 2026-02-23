@@ -64,11 +64,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lora-alpha", type=float, default=16.0)
     ap.add_argument("--lora-dropout", type=float, default=0.0)
     ap.add_argument("--lora-targets", type=str, default="attn.qkv,attn.proj", help="Comma separated name substrings")
+    ap.add_argument("--lora-freeze-epochs", type=int, default=0, help="Freeze LoRA parameters for first N epochs from start (when LoRA is enabled).")
     ap.add_argument("--head-only-warmup-epochs", type=int, default=1, help="Train only heads for first N epochs before enabling LoRA updates.")
     ap.add_argument("--warmup-use-vanilla-backbone", action="store_true", default=True, help="During head warmup, feed frozen vanilla DINO features into heads.")
     ap.add_argument("--no-warmup-use-vanilla-backbone", action="store_false", dest="warmup_use_vanilla_backbone")
     ap.add_argument("--lora-log-every-steps", type=int, default=20, help="Compute/log LoRA movement metrics every N steps (0=off).")
-    ap.add_argument("--pretrain-mode", type=str, choices=["lora", "upscaling"], default="lora")
+    ap.add_argument("--pretrain-mode", type=str, choices=["lora", "upscaling", "lora_upscaling"], default="lora")
     ap.add_argument("--upscale-type", type=str, choices=["learned", "pixelshuffle"], default="learned")
     ap.add_argument("--edge-consistency-weight", type=float, default=0.05, help="Weight for edge consistency regularization in upscaling mode.")
     ap.add_argument("--upscale-gate-init", type=float, default=0.0, help="Initial value for learnable upscaling residual gate (pre-sigmoid).")
@@ -78,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--upscale-sharpen-gain", type=float, default=0.0, help="Optional unsharp gain on fused map in upscaling mode.")
     ap.add_argument("--semantic-smooth-weight", type=float, default=0.0, help="Weight for semantic smoothing regularization in upscaling mode.")
     ap.add_argument("--semantic-smooth-tau", type=float, default=0.2, help="Temperature for semantic affinity in smoothing term.")
+    ap.add_argument("--upscaler-freeze-epochs", type=int, default=0, help="Freeze token upscaler adapter for first N epochs (applies when adapter is enabled).")
 
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--seed", type=int, default=42)
@@ -401,6 +403,8 @@ def print_trainable_summary(
     epoch1_warmup: bool,
     pretrain_mode: str,
     student_token_adapter: nn.Module | None = None,
+    upscaler_frozen_now: bool = False,
+    lora_frozen_now: bool = False,
 ) -> None:
     sb_train, sb_total = count_params(student_backbone)
     ad_train, ad_total = (0, 0)
@@ -413,14 +417,30 @@ def print_trainable_summary(
     lora_max = int(sum(p.numel() for n, p in student_backbone.named_parameters() if "lora_" in n))
     lora_trainable_now = int(sum(p.numel() for n, p in student_backbone.named_parameters() if ("lora_" in n and p.requires_grad)))
     adapter_max = int(ad_total)
-    max_trainable = int((lora_max if str(pretrain_mode) == "lora" else adapter_max) + cls_total + patch_total)
+    mode = str(pretrain_mode).strip().lower()
+    lora_on = mode in {"lora", "lora_upscaling"}
+    adapter_on = mode in {"upscaling", "lora_upscaling"}
+    max_trainable = int((lora_max if lora_on else 0) + (adapter_max if adapter_on else 0) + cls_total + patch_total)
     total_params = int(sb_total + ad_total + cls_total + patch_total)
 
     module_flags: List[str] = []
     if epoch1_warmup:
         module_flags += ["student_cls_head", "student_patch_head"]
     else:
-        if str(pretrain_mode) == "lora":
+        if lora_on and adapter_on:
+            if lora_frozen_now and upscaler_frozen_now:
+                module_flags += ["student_cls_head", "student_patch_head"]
+            elif lora_frozen_now:
+                module_flags += ["student_token_adapter", "student_cls_head", "student_patch_head"]
+            elif upscaler_frozen_now:
+                module_flags += ["student_backbone.lora", "student_cls_head", "student_patch_head"]
+            else:
+                module_flags += ["student_backbone.lora", "student_token_adapter", "student_cls_head", "student_patch_head"]
+        elif adapter_on and upscaler_frozen_now:
+            module_flags += ["student_cls_head", "student_patch_head"]
+        elif lora_on and lora_frozen_now:
+            module_flags += ["student_cls_head", "student_patch_head"]
+        elif lora_on:
             module_flags += ["student_backbone.lora", "student_cls_head", "student_patch_head"]
         else:
             module_flags += ["student_token_adapter", "student_cls_head", "student_patch_head"]
@@ -612,6 +632,22 @@ def _token_grid_shape(num_tokens: int) -> Tuple[int, int]:
         if num_tokens % d == 0:
             return d, num_tokens // d
     return 1, num_tokens
+
+
+def _downsample_patch_logits_to_teacher_grid(
+    student_patch_logits: torch.Tensor,  # [B, Ns, D]
+    teacher_patch_logits: torch.Tensor,  # [B, Nt, D]
+) -> torch.Tensor:
+    if int(student_patch_logits.shape[1]) == int(teacher_patch_logits.shape[1]):
+        return student_patch_logits
+    b, ns, d = student_patch_logits.shape
+    _bt, nt, _dt = teacher_patch_logits.shape
+    sh, sw = _token_grid_shape(int(ns))
+    th, tw = _token_grid_shape(int(nt))
+    x = student_patch_logits.reshape(b, sh, sw, d).permute(0, 3, 1, 2).contiguous()  # [B,D,H,W]
+    y = F.interpolate(x, size=(th, tw), mode="area")
+    out = y.permute(0, 2, 3, 1).reshape(b, th * tw, d).contiguous()
+    return out
 
 
 def _tokens_to_pca_rgb(tokens: torch.Tensor) -> np.ndarray:
@@ -810,14 +846,16 @@ def main() -> None:
         cls_dim = int(fo["x_norm_clstoken"].shape[-1])
 
     pretrain_mode = str(args.pretrain_mode).strip().lower()
+    lora_on = pretrain_mode in {"lora", "lora_upscaling"}
+    adapter_on = pretrain_mode in {"upscaling", "lora_upscaling"}
     student_token_adapter: nn.Module | None = None
     n_lora = 0
-    if pretrain_mode == "lora":
+    if lora_on:
         targets = [s.strip() for s in str(args.lora_targets).split(",") if s.strip()]
         n_lora = apply_lora(student_backbone, target_substrings=targets, rank=int(args.lora_rank), alpha=float(args.lora_alpha), dropout=float(args.lora_dropout))
         _ = apply_lora(teacher_backbone, target_substrings=targets, rank=int(args.lora_rank), alpha=float(args.lora_alpha), dropout=float(args.lora_dropout))
         teacher_backbone.load_state_dict(student_backbone.state_dict(), strict=True)
-    elif pretrain_mode == "upscaling":
+    if adapter_on:
         student_token_adapter = Stage1UpscaleTokenAdapter(
             channels=cls_dim,
             upscale_type=str(args.upscale_type),
@@ -828,24 +866,23 @@ def main() -> None:
             sharpen_gain=float(args.upscale_sharpen_gain),
             semantic_smooth_tau=float(args.semantic_smooth_tau),
         ).to(device)
-    else:
+    if not (lora_on or adapter_on):
         raise RuntimeError(f"Unsupported pretrain_mode={pretrain_mode}")
 
     teacher_backbone.eval()
     for p in teacher_backbone.parameters():
         p.requires_grad = False
 
-    if pretrain_mode == "lora":
+    if lora_on:
         for n, p in student_backbone.named_parameters():
             if "lora_" not in n:
                 p.requires_grad = False
         lora_init = snapshot_lora_params(student_backbone)
-        adapter_init: Dict[str, torch.Tensor] = {}
     else:
         for p in student_backbone.parameters():
             p.requires_grad = False
         lora_init = {}
-        adapter_init = snapshot_module_params(student_token_adapter, prefix="adapter.") if student_token_adapter is not None else {}
+    adapter_init: Dict[str, torch.Tensor] = snapshot_module_params(student_token_adapter, prefix="adapter.") if student_token_adapter is not None else {}
 
     student_cls_head = MLPHead(cls_dim, int(args.proj_hidden_dim), int(args.proj_bottleneck_dim), int(args.out_dim)).to(device)
     teacher_cls_head = MLPHead(cls_dim, int(args.proj_hidden_dim), int(args.proj_bottleneck_dim), int(args.out_dim)).to(device)
@@ -880,10 +917,12 @@ def main() -> None:
     print(f"pretrain_mode={pretrain_mode}")
     print(f"lora_modules={n_lora}")
     epoch1_warmup = bool(int(args.head_only_warmup_epochs) >= 1)
-    if pretrain_mode == "lora":
-        set_lora_trainable(student_backbone, train_lora=not epoch1_warmup)
+    lora_frozen_now = bool(lora_on and int(args.lora_freeze_epochs) >= 1)
+    upscaler_frozen_now = bool(adapter_on and int(args.upscaler_freeze_epochs) >= 1)
+    if lora_on:
+        set_lora_trainable(student_backbone, train_lora=(not epoch1_warmup) and (not lora_frozen_now))
     if student_token_adapter is not None:
-        set_module_trainable(student_token_adapter, trainable=not epoch1_warmup)
+        set_module_trainable(student_token_adapter, trainable=(not epoch1_warmup) and (not upscaler_frozen_now))
     print_trainable_summary(
         student_backbone=student_backbone,
         student_token_adapter=student_token_adapter,
@@ -891,14 +930,18 @@ def main() -> None:
         student_patch_head=student_patch_head,
         epoch1_warmup=epoch1_warmup,
         pretrain_mode=pretrain_mode,
+        upscaler_frozen_now=upscaler_frozen_now,
+        lora_frozen_now=lora_frozen_now,
     )
 
     for epoch in range(1, int(args.epochs) + 1):
         in_head_warmup = epoch <= int(args.head_only_warmup_epochs)
-        if pretrain_mode == "lora":
-            set_lora_trainable(student_backbone, train_lora=not in_head_warmup)
+        lora_frozen_now = bool(lora_on and epoch <= int(args.lora_freeze_epochs))
+        upscaler_frozen_now = bool(adapter_on and epoch <= int(args.upscaler_freeze_epochs))
+        if lora_on:
+            set_lora_trainable(student_backbone, train_lora=(not in_head_warmup) and (not lora_frozen_now))
         if student_token_adapter is not None:
-            set_module_trainable(student_token_adapter, trainable=not in_head_warmup)
+            set_module_trainable(student_token_adapter, trainable=(not in_head_warmup) and (not upscaler_frozen_now))
         student_backbone.train()
         if student_token_adapter is not None:
             student_token_adapter.train()
@@ -936,7 +979,7 @@ def main() -> None:
             edge_consistency_terms: List[torch.Tensor] = []
             semantic_smooth_terms: List[torch.Tensor] = []
             for c in crops:
-                dino_c = _prepare_dino_scaled_input(c, patch=patch) if pretrain_mode == "upscaling" else c
+                dino_c = _prepare_dino_scaled_input(c, patch=patch) if adapter_on else c
                 if in_head_warmup and bool(args.warmup_use_vanilla_backbone) and (vanilla_backbone is not None):
                     with torch.no_grad():
                         fs = vanilla_backbone.forward_features(dino_c)
@@ -944,20 +987,27 @@ def main() -> None:
                     fs = student_backbone.forward_features(dino_c)
                 cls = fs["x_norm_clstoken"]
                 tok = fs["x_norm_patchtokens"]
+                tok_head = tok
                 if (student_token_adapter is not None) and (not in_head_warmup):
-                    tok, e_loss, s_loss = student_token_adapter.forward_with_edge_loss(tok, image=c, patch_size=patch)
+                    tok, tok_up, e_loss, s_loss = student_token_adapter.forward_with_upsampled_tokens(
+                        tok,
+                        image=c,
+                        patch_size=patch,
+                    )
                     edge_consistency_terms.append(e_loss)
                     semantic_smooth_terms.append(s_loss)
-                    cls = tok.mean(dim=1)
+                    # Student heads consume high-resolution adapted tokens.
+                    tok_head = tok_up
+                    cls = tok_head.mean(dim=1)
                 student_cls_logits.append(student_cls_head(cls))
-                pt = student_patch_head(tok.reshape(-1, tok.shape[-1])).reshape(tok.shape[0], tok.shape[1], -1)
+                pt = student_patch_head(tok_head.reshape(-1, tok_head.shape[-1])).reshape(tok_head.shape[0], tok_head.shape[1], -1)
                 student_patch_logits.append(pt)
 
             with torch.no_grad():
                 teacher_cls_logits: List[torch.Tensor] = []
                 teacher_patch_logits: List[torch.Tensor] = []
                 for c in crops[:2]:  # global only
-                    dino_c = _prepare_dino_scaled_input(c, patch=patch) if pretrain_mode == "upscaling" else c
+                    dino_c = _prepare_dino_scaled_input(c, patch=patch) if adapter_on else c
                     ft = teacher_backbone.forward_features(dino_c)
                     cls_t = ft["x_norm_clstoken"]
                     tok_t = ft["x_norm_patchtokens"]
@@ -985,6 +1035,8 @@ def main() -> None:
             for gidx in range(2):
                 spt = student_patch_logits[gidx]
                 tpt = teacher_patch_logits[gidx].detach()
+                # Student may use high-resolution token heads; align to teacher token grid.
+                spt = _downsample_patch_logits_to_teacher_grid(spt, tpt)
                 bsz, ntok, dim = spt.shape
                 mask = random_token_mask(bsz, ntok, ratio=float(args.ibot_mask_ratio), device=device)
 
@@ -1027,7 +1079,7 @@ def main() -> None:
 
             with torch.no_grad():
                 mom = 1.0 - (1.0 - float(args.teacher_momentum)) * (math.cos(math.pi * step / max(1, total_steps)) + 1.0) / 2.0
-                if pretrain_mode == "lora":
+                if lora_on:
                     update_teacher(student_backbone, teacher_backbone, momentum=mom)
                 for ps, pt in zip(student_cls_head.parameters(), teacher_cls_head.parameters()):
                     pt.data.mul_(mom).add_(ps.data, alpha=1.0 - mom)
@@ -1056,14 +1108,14 @@ def main() -> None:
             step += 1
 
             lora_log_n = int(args.lora_log_every_steps)
-            if pretrain_mode == "lora" and lora_log_n > 0 and (step % lora_log_n == 0):
+            if lora_on and lora_log_n > 0 and (step % lora_log_n == 0):
                 lm = lora_movement_metrics(student_backbone, lora_init)
                 lora_norm_last = float(lm["lora_norm"])
                 lora_delta_meter += float(lm["lora_delta_norm"])
                 lora_rel_meter += float(lm["lora_delta_rel"])
                 lora_measure_count += 1
             if (
-                pretrain_mode == "upscaling"
+                adapter_on
                 and student_token_adapter is not None
                 and lora_log_n > 0
                 and (step % lora_log_n == 0)
@@ -1090,7 +1142,7 @@ def main() -> None:
                             align_corners=False,
                         )
                     with torch.no_grad():
-                        dbg_dino = _prepare_dino_scaled_input(dbg_in, patch=patch) if pretrain_mode == "upscaling" else dbg_in
+                        dbg_dino = _prepare_dino_scaled_input(dbg_in, patch=patch) if adapter_on else dbg_in
                         v_feat = vanilla_backbone.forward_features(dbg_dino)
                         s_feat = student_backbone.forward_features(dbg_dino)
                         v_tok = v_feat["x_norm_patchtokens"][0]
@@ -1134,7 +1186,7 @@ def main() -> None:
                 "pact": f"{(proto_active_frac_meter/step_in_epoch):.3f}",
                 "lr": f"{lr_now:.2e}",
             }
-            if pretrain_mode == "lora":
+            if lora_on:
                 postfix["lora_d"] = (
                     f"{(lora_delta_meter/max(1, lora_measure_count)):.3f}"
                     if int(args.lora_log_every_steps) > 0
@@ -1145,7 +1197,7 @@ def main() -> None:
                     if int(args.lora_log_every_steps) > 0
                     else "off"
                 )
-            else:
+            if adapter_on:
                 postfix["up_d"] = (
                     f"{(up_delta_meter/max(1, up_measure_count)):.3f}"
                     if int(args.lora_log_every_steps) > 0
@@ -1169,34 +1221,48 @@ def main() -> None:
             "semantic_smooth_loss": semantic_smooth_meter / epoch_steps,
             "lr": lr_now,
             "head_only_warmup": bool(in_head_warmup),
+            "lora_frozen": bool(lora_frozen_now),
+            "upscaler_frozen": bool(upscaler_frozen_now),
             "proto_entropy": proto_entropy_meter / epoch_steps,
             "proto_top1": proto_top1_meter / epoch_steps,
             "proto_active_frac": proto_active_frac_meter / epoch_steps,
-            "lora_norm_last": float(lora_norm_last) if pretrain_mode == "lora" else 0.0,
+            "lora_norm_last": float(lora_norm_last) if lora_on else 0.0,
             "lora_delta_norm_avg": (
                 float(lora_delta_meter / max(1, lora_measure_count))
-                if (pretrain_mode == "lora" and int(args.lora_log_every_steps) > 0)
+                if (lora_on and int(args.lora_log_every_steps) > 0)
                 else 0.0
             ),
             "lora_delta_rel_avg": (
                 float(lora_rel_meter / max(1, lora_measure_count))
-                if (pretrain_mode == "lora" and int(args.lora_log_every_steps) > 0)
+                if (lora_on and int(args.lora_log_every_steps) > 0)
                 else 0.0
             ),
-            "up_norm_last": float(up_norm_last) if pretrain_mode == "upscaling" else 0.0,
+            "up_norm_last": float(up_norm_last) if adapter_on else 0.0,
             "up_delta_norm_avg": (
                 float(up_delta_meter / max(1, up_measure_count))
-                if (pretrain_mode == "upscaling" and int(args.lora_log_every_steps) > 0)
+                if (adapter_on and int(args.lora_log_every_steps) > 0)
                 else 0.0
             ),
             "up_delta_rel_avg": (
                 float(up_rel_meter / max(1, up_measure_count))
-                if (pretrain_mode == "upscaling" and int(args.lora_log_every_steps) > 0)
+                if (adapter_on and int(args.lora_log_every_steps) > 0)
                 else 0.0
             ),
         }
         history.append(row)
-        if pretrain_mode == "lora":
+        if lora_on and adapter_on:
+            print(
+                f"epoch={epoch:02d} loss={row['loss']:.4f} dino={row['dino_loss']:.4f} "
+                f"ibot={row['ibot_loss']:.4f} koleo={row['koleo_loss']:.4f} "
+                f"edge={row['edge_consistency_loss']:.4f} ssmth={row['semantic_smooth_loss']:.4f} "
+                f"pent={row['proto_entropy']:.2f} ptop1={row['proto_top1']:.4f} pact={row['proto_active_frac']:.3f} "
+                f"lora_norm={row['lora_norm_last']:.3f} lora_d={row['lora_delta_norm_avg']:.3f} "
+                f"lora_rel={row['lora_delta_rel_avg']:.4f} up_norm={row['up_norm_last']:.3f} "
+                f"up_d={row['up_delta_norm_avg']:.3f} up_rel={row['up_delta_rel_avg']:.4f} "
+                f"warmup={int(row['head_only_warmup'])} lora_freeze={int(row['lora_frozen'])} "
+                f"up_freeze={int(row['upscaler_frozen'])} lr={row['lr']:.6e}"
+            )
+        elif lora_on:
             print(
                 f"epoch={epoch:02d} loss={row['loss']:.4f} dino={row['dino_loss']:.4f} "
                 f"ibot={row['ibot_loss']:.4f} koleo={row['koleo_loss']:.4f} "
@@ -1206,7 +1272,8 @@ def main() -> None:
                 f"lora_norm={row['lora_norm_last']:.3f} "
                 f"lora_d={row['lora_delta_norm_avg']:.3f} "
                 f"lora_rel={row['lora_delta_rel_avg']:.4f} "
-                f"warmup={int(row['head_only_warmup'])} lr={row['lr']:.6e}"
+                f"warmup={int(row['head_only_warmup'])} lora_freeze={int(row['lora_frozen'])} "
+                f"up_freeze={int(row['upscaler_frozen'])} lr={row['lr']:.6e}"
             )
         else:
             print(
@@ -1218,7 +1285,8 @@ def main() -> None:
                 f"up_norm={row['up_norm_last']:.3f} "
                 f"up_d={row['up_delta_norm_avg']:.3f} "
                 f"up_rel={row['up_delta_rel_avg']:.4f} "
-                f"warmup={int(row['head_only_warmup'])} lr={row['lr']:.6e}"
+                f"warmup={int(row['head_only_warmup'])} lora_freeze={int(row['lora_frozen'])} "
+                f"up_freeze={int(row['upscaler_frozen'])} lr={row['lr']:.6e}"
             )
 
         if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0 or epoch == int(args.epochs)):

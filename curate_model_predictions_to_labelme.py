@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import shutil
 import warnings
 from pathlib import Path
@@ -16,6 +17,7 @@ import torchvision
 from torchvision.transforms import functional as TF
 
 from models import Stage1SegNet, load_stage1_state_dict_compat
+from pretrain_dino_lora_ssl import Stage1UpscaleTokenAdapter
 from wtcv_utils.tiling import crop_with_pad, tile_origins
 
 
@@ -46,7 +48,123 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Dict]:
+class LoRALinear(torch.nn.Module):
+    def __init__(self, base: torch.nn.Linear, rank: int, alpha: float, dropout: float):
+        super().__init__()
+        self.base = base
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+        self.rank = int(rank)
+        self.scale = float(alpha) / float(max(1, rank))
+        self.drop = torch.nn.Dropout(float(dropout)) if dropout > 0 else torch.nn.Identity()
+        self.lora_a = torch.nn.Linear(base.in_features, self.rank, bias=False)
+        self.lora_b = torch.nn.Linear(self.rank, base.out_features, bias=False)
+        torch.nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_b.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.lora_b(self.drop(self.lora_a(x))) * self.scale
+
+
+def apply_lora(model: torch.nn.Module, target_substrings: List[str], rank: int, alpha: float, dropout: float) -> int:
+    names = [n for n, _ in model.named_modules()]
+    replaced = 0
+    for full_name in names:
+        if not any(s in full_name for s in target_substrings):
+            continue
+        parent_name = full_name.rsplit(".", 1)[0] if "." in full_name else ""
+        child_name = full_name.split(".")[-1]
+        parent = model.get_submodule(parent_name) if parent_name else model
+        child = getattr(parent, child_name, None)
+        if isinstance(child, torch.nn.Linear):
+            mod = LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout)
+            mod = mod.to(device=child.weight.device, dtype=child.weight.dtype)
+            setattr(parent, child_name, mod)
+            replaced += 1
+    return replaced
+
+
+def _prepare_dino_scaled_input(x: torch.Tensor, patch: int = 14, scale_num: int = 14, scale_den: int = 16) -> torch.Tensor:
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    dh = int(round(float(h) * float(scale_num) / float(scale_den)))
+    dw = int(round(float(w) * float(scale_num) / float(scale_den)))
+    dh = max(int(patch), int((dh // int(patch)) * int(patch)))
+    dw = max(int(patch), int((dw // int(patch)) * int(patch)))
+    if (dh, dw) == (h, w):
+        return x
+    return F.interpolate(x, size=(dh, dw), mode="bilinear", align_corners=False)
+
+
+def _infer_grid_from_tokens(n_tokens: int, h: int, w: int, patch: int = 14) -> Tuple[int, int]:
+    gh = max(1, int(h // patch))
+    gw = max(1, int(w // patch))
+    if gh * gw == int(n_tokens):
+        return gh, gw
+    target_ar = float(w) / float(max(1, h))
+    best = None
+    nn = int(n_tokens)
+    for d in range(1, int(math.sqrt(float(nn))) + 1):
+        if (nn % d) != 0:
+            continue
+        a, b = int(d), int(nn // d)
+        for hh, ww in ((a, b), (b, a)):
+            ar = float(ww) / float(max(1, hh))
+            score = abs(ar - target_ar)
+            if best is None or score < best[0]:
+                best = (score, hh, ww)
+    if best is None:
+        raise RuntimeError(f"Cannot infer token grid for N={n_tokens}")
+    return int(best[1]), int(best[2])
+
+
+class SSLPretrainInferenceModel(torch.nn.Module):
+    def __init__(
+        self,
+        backbone: torch.nn.Module,
+        adapter: Stage1UpscaleTokenAdapter | None,
+        pretrain_mode: str,
+        patch_size: int = 14,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.adapter = adapter
+        self.pretrain_mode = str(pretrain_mode).strip().lower()
+        self.patch_size = int(patch_size)
+        self.adapter_on = self.pretrain_mode in {"upscaling", "lora_upscaling"} and (adapter is not None)
+
+    def forward(self, x: torch.Tensor, return_features: bool = False) -> Dict[str, torch.Tensor]:
+        x_dino = _prepare_dino_scaled_input(x, patch=self.patch_size) if self.adapter_on else x
+        feats = self.backbone.forward_features(x_dino)
+        tok = feats["x_norm_patchtokens"]  # [B,N,C]
+        if self.adapter_on and self.adapter is not None:
+            tok, _edge, _sem = self.adapter.forward_with_edge_loss(tok, image=x, patch_size=self.patch_size)
+
+        b, n, c = tok.shape
+        gh, gw = _infer_grid_from_tokens(
+            int(n),
+            h=int(x_dino.shape[-2]),
+            w=int(x_dino.shape[-1]),
+            patch=self.patch_size,
+        )
+        fmap = tok.transpose(1, 2).reshape(b, c, gh, gw).contiguous()
+
+        # Unsupervised inference proxy: channel-norm saliency map -> logits
+        sal = torch.linalg.vector_norm(fmap, dim=1, ord=2, keepdim=True)
+        s_min = sal.amin(dim=(-2, -1), keepdim=True)
+        s_max = sal.amax(dim=(-2, -1), keepdim=True)
+        prob = (sal - s_min) / (s_max - s_min + 1e-6)
+        prob = prob.clamp(1e-4, 1.0 - 1e-4)
+        seg_logit = torch.logit(prob)
+
+        out: Dict[str, torch.Tensor] = {"seg_logit": seg_logit}
+        if return_features:
+            out["feat_dino"] = fmap
+            out["feat_adapted"] = fmap
+        return out
+
+
+def load_model(checkpoint: Path, device: torch.device) -> Tuple[torch.nn.Module, Dict]:
     try:
         ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     except Exception as e:
@@ -55,6 +173,58 @@ def load_model(checkpoint: Path, device: torch.device) -> Tuple[Stage1SegNet, Di
             f"Use trusted checkpoints only. Error: {e}"
         )
         ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+
+    # SSL pretrain checkpoints (LoRA / upscaling / lora_upscaling)
+    if isinstance(ckpt, dict) and ("student_backbone" in ckpt) and ("model" not in ckpt):
+        args = ckpt.get("args", {}) if isinstance(ckpt.get("args", {}), dict) else {}
+        pretrain_mode = str(args.get("pretrain_mode", "lora")).strip().lower()
+        dino_model = str(args.get("dino_model", "dinov2_vits14_reg"))
+
+        backbone = torch.hub.load("facebookresearch/dinov2", dino_model, trust_repo=True).to(device).eval()
+        if pretrain_mode in {"lora", "lora_upscaling"}:
+            rank = int(args.get("lora_rank", 8))
+            alpha = float(args.get("lora_alpha", 16.0))
+            dropout = float(args.get("lora_dropout", 0.0))
+            targets = [s.strip() for s in str(args.get("lora_targets", "attn.qkv,attn.proj")).split(",") if s.strip()]
+            _ = apply_lora(backbone, target_substrings=targets, rank=rank, alpha=alpha, dropout=dropout)
+        backbone.load_state_dict(ckpt["student_backbone"], strict=True)
+        for p in backbone.parameters():
+            p.requires_grad = False
+
+        adapter: Stage1UpscaleTokenAdapter | None = None
+        if pretrain_mode in {"upscaling", "lora_upscaling"} and ckpt.get("student_token_adapter", None) is not None:
+            probe = torch.randn(1, 3, 224, 224, device=device)
+            with torch.inference_mode():
+                cdim = int(backbone.forward_features(probe)["x_norm_clstoken"].shape[-1])
+            adapter = Stage1UpscaleTokenAdapter(
+                channels=cdim,
+                upscale_type=str(args.get("upscale_type", "learned")),
+                gate_init=float(args.get("upscale_gate_init", 0.0)),
+                local_gain=float(args.get("upscale_local_gain", 1.0)),
+                dino_gain=float(args.get("upscale_dino_gain", 1.0)),
+                refine_gain=float(args.get("upscale_refine_gain", 1.0)),
+                sharpen_gain=float(args.get("upscale_sharpen_gain", 0.0)),
+                semantic_smooth_tau=float(args.get("semantic_smooth_tau", 0.2)),
+            ).to(device)
+            adapter.load_state_dict(ckpt["student_token_adapter"], strict=False)
+            adapter.eval()
+            for p in adapter.parameters():
+                p.requires_grad = False
+
+        model = SSLPretrainInferenceModel(
+            backbone=backbone,
+            adapter=adapter,
+            pretrain_mode=pretrain_mode,
+            patch_size=14,
+        ).to(device)
+        model.eval()
+        info = {
+            "checkpoint_type": "ssl_pretrain",
+            "pretrain_mode": pretrain_mode,
+            "dino_model": dino_model,
+            "has_adapter": bool(adapter is not None),
+        }
+        return model, info
 
     ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
     fusion_channels = int(ckpt_cfg.get("fusion_channels", 256))

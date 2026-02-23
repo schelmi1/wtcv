@@ -124,7 +124,7 @@ def single_image_infer(
 def build_content() -> None:
     with gr.Row():
         infer_image_path = gr.Textbox(value="", label="Image Path", info="Path to the single image to run inference on.")
-        infer_ckpt = gr.Textbox(value="", label="Checkpoint", info="Path to a trained model checkpoint (.pt) to load for inference/evaluation.")
+        infer_ckpt = gr.Textbox(value="", label="Checkpoint", info="Path to checkpoint (.pt). Supports Stage1 seg checkpoints and SSL pretrain LoRA/upscaling checkpoints.")
         infer_label = gr.Textbox(value="vehicle", label="Label", info="Class label name used for output polygons and evaluation target.")
     with gr.Row():
         infer_tile = gr.Number(value=256, precision=0, label="Tile Size", info="Side length of each square inference/training tile in pixels.")

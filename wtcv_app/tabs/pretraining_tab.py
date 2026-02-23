@@ -43,6 +43,7 @@ def run_pretraining(
     edge_consistency_weight: float,
     semantic_smooth_weight: float,
     semantic_smooth_tau: float,
+    upscaler_freeze_epochs: int,
     upscale_gate_init: float,
     upscale_local_gain: float,
     upscale_dino_gain: float,
@@ -52,6 +53,7 @@ def run_pretraining(
     lora_alpha: float,
     lora_dropout: float,
     lora_targets: str,
+    lora_freeze_epochs: int,
     head_only_warmup_epochs: int,
     warmup_use_vanilla_backbone: bool,
     seed: int,
@@ -130,6 +132,8 @@ def run_pretraining(
         str(float(semantic_smooth_weight)),
         "--semantic-smooth-tau",
         str(float(semantic_smooth_tau)),
+        "--upscaler-freeze-epochs",
+        str(int(upscaler_freeze_epochs)),
         "--upscale-gate-init",
         str(float(upscale_gate_init)),
         "--upscale-local-gain",
@@ -148,6 +152,8 @@ def run_pretraining(
         str(float(lora_dropout)),
         "--lora-targets",
         str(lora_targets),
+        "--lora-freeze-epochs",
+        str(int(lora_freeze_epochs)),
         "--head-only-warmup-epochs",
         str(int(head_only_warmup_epochs)),
         "--seed",
@@ -224,7 +230,7 @@ def build_tab(root: Path, nested: bool = False) -> None:
             warmup_use_vanilla_backbone = gr.Dropdown(choices=["on", "off"], value="on", label="Warmup uses vanilla DINO")
         with gr.Row():
             pretrain_mode = gr.Dropdown(
-                choices=["lora", "upscaling"],
+                choices=["lora", "upscaling", "lora_upscaling"],
                 value="lora",
                 label="Pretrain Mode",
                 info="Choose backbone adaptation strategy for SSL pretraining.",
@@ -250,6 +256,12 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 value=0.2,
                 label="Semantic Smooth Tau",
                 info="Affinity temperature for semantic smoothing (lower = sharper affinity).",
+            )
+            upscaler_freeze_epochs = gr.Number(
+                value=0,
+                precision=0,
+                label="Upscaler Freeze Epochs",
+                info="Freeze upscaler adapter for first N epochs (useful in lora_upscaling mode).",
             )
             upscale_gate_init = gr.Number(
                 value=0.0,
@@ -281,6 +293,7 @@ def build_tab(root: Path, nested: bool = False) -> None:
             lora_alpha = gr.Number(value=16.0, label="LoRA Alpha", info="LoRA scaling factor (effective strength is alpha/rank).")
             lora_dropout = gr.Number(value=0.0, label="LoRA Dropout", info="Dropout inside LoRA branch.")
             lora_targets = gr.Textbox(value="attn.qkv,attn.proj", label="LoRA Targets", info="Comma-separated module name substrings to inject LoRA into.")
+            lora_freeze_epochs = gr.Number(value=0, precision=0, label="LoRA Freeze Epochs", info="Freeze LoRA params for first N epochs from start.")
         with gr.Row():
             device = gr.Textbox(value="", label="Device (blank=auto)")
             trust_torch_hub_repo = gr.Dropdown(choices=["on", "off"], value="on", label="Trust torch.hub repo")
@@ -290,8 +303,10 @@ def build_tab(root: Path, nested: bool = False) -> None:
         logs = gr.Textbox(label="Live Logs", lines=22, elem_classes=["mono"], interactive=False)
 
         def _on_mode_change(mode: str):
-            is_lora = str(mode).strip().lower() == "lora"
-            return gr.update(visible=is_lora), gr.update(visible=(not is_lora))
+            m = str(mode).strip().lower()
+            is_lora = m in {"lora", "lora_upscaling"}
+            is_up = m in {"upscaling", "lora_upscaling"}
+            return gr.update(visible=is_lora), gr.update(visible=is_up)
 
         pretrain_mode.change(
             fn=_on_mode_change,
@@ -335,6 +350,7 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 edge_consistency_weight,
                 semantic_smooth_weight,
                 semantic_smooth_tau,
+                upscaler_freeze_epochs,
                 upscale_gate_init,
                 upscale_local_gain,
                 upscale_dino_gain,
@@ -344,6 +360,7 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 lora_alpha,
                 lora_dropout,
                 lora_targets,
+                lora_freeze_epochs,
                 head_only_warmup_epochs,
                 warmup_use_vanilla_backbone,
                 seed,

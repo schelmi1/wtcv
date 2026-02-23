@@ -34,6 +34,234 @@ from wtcv_utils.labelme import polygon_area
 from wtcv_utils.records import discover_labels, load_labelme_records
 from wtcv_utils.tiling import crop_with_pad, tile_origins
 
+
+class _TrainLoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float):
+        super().__init__()
+        self.base = base
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+        self.rank = int(rank)
+        self.scale = float(alpha) / float(max(1, rank))
+        self.drop = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
+        self.lora_a = nn.Linear(base.in_features, self.rank, bias=False)
+        self.lora_b = nn.Linear(self.rank, base.out_features, bias=False)
+        nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.lora_b(self.drop(self.lora_a(x))) * self.scale
+
+
+def _apply_lora_for_ssl_init(
+    model: nn.Module,
+    target_substrings: List[str],
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> int:
+    names = [n for n, _ in model.named_modules()]
+    replaced = 0
+    for full_name in names:
+        if not any(s in full_name for s in target_substrings):
+            continue
+        parent_name = full_name.rsplit(".", 1)[0] if "." in full_name else ""
+        child_name = full_name.split(".")[-1]
+        parent = model.get_submodule(parent_name) if parent_name else model
+        child = getattr(parent, child_name, None)
+        if isinstance(child, nn.Linear):
+            mod = _TrainLoRALinear(child, rank=rank, alpha=alpha, dropout=dropout)
+            mod = mod.to(device=child.weight.device, dtype=child.weight.dtype)
+            setattr(parent, child_name, mod)
+            replaced += 1
+    return replaced
+
+
+def _load_ssl_pretrain_init_into_stage1(
+    model: Stage1SegNet,
+    ssl_blob: Dict,
+) -> Dict[str, object]:
+    args = ssl_blob.get("args", {}) if isinstance(ssl_blob.get("args", {}), dict) else {}
+    pretrain_mode = str(args.get("pretrain_mode", "lora")).strip().lower()
+    out: Dict[str, object] = {
+        "pretrain_mode": pretrain_mode,
+        "ssl_upscale_type": str(args.get("upscale_type", "")),
+        "lora_modules_wrapped": 0,
+        "lora_tensors_loaded": 0,
+        "lora_params_loaded": 0,
+        "backbone_missing": 0,
+        "backbone_unexpected": 0,
+        "adapter_loaded": 0,
+        "adapter_up_tensors_loaded": 0,
+        "adapter_local_tensors_loaded": 0,
+        "adapter_local_params_loaded": 0,
+        "adapter_params_loaded": 0,
+        "adapter_up_tensors_interpolated": 0,
+        "adapter_up_params_interpolated": 0,
+        "adapter_up_skipped_shape": 0,
+        "adapter_local_skipped_shape": 0,
+        "adapter_up_unmatched": 0,
+        "adapter_local_unmatched": 0,
+        "adapter_skipped_shape": 0,
+        "adapter_unmatched": 0,
+    }
+
+    if pretrain_mode in {"lora", "lora_upscaling"}:
+        rank = int(args.get("lora_rank", 8))
+        alpha = float(args.get("lora_alpha", 16.0))
+        dropout = float(args.get("lora_dropout", 0.0))
+        targets = [s.strip() for s in str(args.get("lora_targets", "attn.qkv,attn.proj")).split(",") if s.strip()]
+        out["lora_modules_wrapped"] = int(
+            _apply_lora_for_ssl_init(
+                model.dino.backbone,
+                target_substrings=targets,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+            )
+        )
+
+    backbone_state = ssl_blob.get("student_backbone", None)
+    if isinstance(backbone_state, dict):
+        missing, unexpected = model.dino.backbone.load_state_dict(backbone_state, strict=False)
+        out["backbone_missing"] = int(len(missing))
+        out["backbone_unexpected"] = int(len(unexpected))
+        model_backbone_state = model.dino.backbone.state_dict()
+        lora_tensors = 0
+        lora_params = 0
+        for k, v in backbone_state.items():
+            if "lora_" not in str(k):
+                continue
+            if k not in model_backbone_state:
+                continue
+            if tuple(v.shape) != tuple(model_backbone_state[k].shape):
+                continue
+            lora_tensors += 1
+            lora_params += int(v.numel())
+        out["lora_tensors_loaded"] = int(lora_tensors)
+        out["lora_params_loaded"] = int(lora_params)
+
+    adapter_state = ssl_blob.get("student_token_adapter", None)
+    if (
+        isinstance(adapter_state, dict)
+        and pretrain_mode in {"upscaling", "lora_upscaling"}
+        and model.dino_upsampler_type in {"learned", "pixelshuffle"}
+        and model.local is not None
+    ):
+        model_state = model.state_dict()
+        remap: Dict[str, torch.Tensor] = {}
+        loaded = 0
+        loaded_up = 0
+        loaded_local = 0
+        loaded_local_params = 0
+        loaded_params = 0
+        up_interp = 0
+        up_interp_params = 0
+        skipped_shape = 0
+        skipped_shape_up = 0
+        skipped_shape_local = 0
+        unmatched = 0
+        unmatched_up = 0
+        unmatched_local = 0
+
+        map_prefixes = [
+            ("up.", "dino_up."),
+            ("local.", "local."),
+        ]
+
+        def _resize_conv_oi(src: torch.Tensor, tgt_shape: torch.Size) -> Optional[torch.Tensor]:
+            # Resize conv weights [O, I, Kh, Kw] across O/I channels if kernels match.
+            if src.ndim != 4 or len(tgt_shape) != 4:
+                return None
+            so, si, skh, skw = int(src.shape[0]), int(src.shape[1]), int(src.shape[2]), int(src.shape[3])
+            to, ti, tkh, tkw = int(tgt_shape[0]), int(tgt_shape[1]), int(tgt_shape[2]), int(tgt_shape[3])
+            if (skh, skw) != (tkh, tkw):
+                return None
+            x = src.permute(2, 3, 0, 1).reshape(skh * skw, 1, so, si)
+            y = F.interpolate(x, size=(to, ti), mode="bilinear", align_corners=False)
+            w = y.reshape(skh, skw, to, ti).permute(2, 3, 0, 1).contiguous()
+            return w.to(dtype=src.dtype)
+
+        def _resize_bias(src: torch.Tensor, tgt_shape: torch.Size) -> Optional[torch.Tensor]:
+            # Resize bias [O] if channel count differs.
+            if src.ndim != 1 or len(tgt_shape) != 1:
+                return None
+            x = src.view(1, 1, -1)
+            y = F.interpolate(x, size=int(tgt_shape[0]), mode="linear", align_corners=False)
+            return y.view(int(tgt_shape[0])).to(dtype=src.dtype)
+
+        for src_k, src_v in adapter_state.items():
+            matched = False
+            for src_pfx, dst_pfx in map_prefixes:
+                if not str(src_k).startswith(src_pfx):
+                    continue
+                dst_k = dst_pfx + str(src_k)[len(src_pfx):]
+                matched = True
+                if dst_k not in model_state:
+                    unmatched += 1
+                    if str(src_k).startswith("up."):
+                        unmatched_up += 1
+                    elif str(src_k).startswith("local."):
+                        unmatched_local += 1
+                    break
+                if tuple(src_v.shape) != tuple(model_state[dst_k].shape):
+                    # Best-effort transfer for upsampler channel-size changes (e.g. 384 -> 256).
+                    if str(src_k).startswith("up."):
+                        resized = None
+                        if src_v.ndim == 4 and model_state[dst_k].ndim == 4:
+                            resized = _resize_conv_oi(src_v, model_state[dst_k].shape)
+                        elif src_v.ndim == 1 and model_state[dst_k].ndim == 1:
+                            resized = _resize_bias(src_v, model_state[dst_k].shape)
+                        if resized is not None and tuple(resized.shape) == tuple(model_state[dst_k].shape):
+                            remap[dst_k] = resized.to(dtype=model_state[dst_k].dtype)
+                            loaded += 1
+                            loaded_up += 1
+                            loaded_params += int(resized.numel())
+                            up_interp += 1
+                            up_interp_params += int(resized.numel())
+                            break
+                    skipped_shape += 1
+                    if str(src_k).startswith("up."):
+                        skipped_shape_up += 1
+                    elif str(src_k).startswith("local."):
+                        skipped_shape_local += 1
+                    break
+                remap[dst_k] = src_v
+                loaded += 1
+                loaded_params += int(src_v.numel())
+                if str(src_k).startswith("up."):
+                    loaded_up += 1
+                elif str(src_k).startswith("local."):
+                    loaded_local += 1
+                    loaded_local_params += int(src_v.numel())
+                break
+            if not matched:
+                unmatched += 1
+
+        if len(remap) > 0:
+            model.load_state_dict(remap, strict=False)
+        out["adapter_loaded"] = int(loaded)
+        out["adapter_up_tensors_loaded"] = int(loaded_up)
+        out["adapter_local_tensors_loaded"] = int(loaded_local)
+        out["adapter_local_params_loaded"] = int(loaded_local_params)
+        out["adapter_params_loaded"] = int(loaded_params)
+        out["adapter_up_tensors_interpolated"] = int(up_interp)
+        out["adapter_up_params_interpolated"] = int(up_interp_params)
+        out["adapter_up_skipped_shape"] = int(skipped_shape_up)
+        out["adapter_local_skipped_shape"] = int(skipped_shape_local)
+        out["adapter_up_unmatched"] = int(unmatched_up)
+        out["adapter_local_unmatched"] = int(unmatched_local)
+        out["adapter_skipped_shape"] = int(skipped_shape)
+        out["adapter_unmatched"] = int(unmatched)
+    elif pretrain_mode in {"upscaling", "lora_upscaling"}:
+        out["adapter_note"] = (
+            f"skipped adapter transfer (stage1 dino_upsampler_type={model.dino_upsampler_type}, "
+            f"has_local={model.local is not None})"
+        )
+
+    return out
+
 @dataclass
 class Cfg:
     data_dir: Path
@@ -1474,18 +1702,31 @@ def main() -> None:
 
     resume_ckpt = cfg.resume_checkpoint
     resume_blob = None
+    ssl_init_blob = None
+    ssl_init_ckpt: Optional[Path] = None
     if resume_ckpt is not None:
         if not resume_ckpt.exists():
             raise FileNotFoundError(f"Missing resume checkpoint: {resume_ckpt}")
         try:
-            resume_blob = torch.load(resume_ckpt, map_location="cpu", weights_only=True)
+            loaded_blob = torch.load(resume_ckpt, map_location="cpu", weights_only=True)
         except Exception:
             # Older checkpoints may require full unpickling.
-            resume_blob = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+            loaded_blob = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+
+        if isinstance(loaded_blob, dict) and ("student_backbone" in loaded_blob) and ("model" not in loaded_blob):
+            ssl_init_blob = loaded_blob
+            ssl_init_ckpt = resume_ckpt
+        else:
+            resume_blob = loaded_blob
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     if cfg.run_name == "":
-        run_suffix = "resume" if resume_ckpt is not None else ""
+        if resume_blob is not None:
+            run_suffix = "resume"
+        elif ssl_init_blob is not None:
+            run_suffix = "ssl-init"
+        else:
+            run_suffix = ""
         run_slug = f"{stamp}-{run_suffix}" if run_suffix else stamp
     else:
         run_slug = f"{stamp}-{cfg.run_name}"
@@ -1527,14 +1768,21 @@ def main() -> None:
             ("images_with_pos_labels", counts_all["images_with_pos_labels"]),
             ("images_with_neg_labels", counts_all["images_with_neg_labels"]),
             ("resume_checkpoint", str(cfg.resume_checkpoint) if cfg.resume_checkpoint else "None"),
+            ("ssl_init_checkpoint", str(ssl_init_ckpt) if ssl_init_ckpt else "None"),
             ("seed", cfg.seed),
         ]
     )
-    if cfg.resume_checkpoint is not None:
+    if resume_blob is not None:
         print("  resume_notes:")
         print("    - --epochs is interpreted as additional epochs when resuming")
         print("    - resume always writes to a new run directory")
         print("    - resume resets LR/scheduler to cfg.lr/cfg.lr_min for the new run")
+    elif ssl_init_blob is not None:
+        print("  ssl_init_notes:")
+        print("    - resume_checkpoint was detected as SSL pretrain checkpoint")
+        print("    - DINO backbone (and LoRA, if present) are initialized from SSL checkpoint")
+        print("    - token adapter weights are partially transferred into stage1 upsampler/local branches")
+        print("    - optimizer/scheduler/history are fresh (not resumed)")
 
     print_section("Data + Tiling")
     print_kv_rows(
@@ -1807,6 +2055,48 @@ def main() -> None:
         use_tile_cls_head=cfg.use_tile_cls_head,
         use_zoom_cls_head=cfg.use_zoom_cls_head,
     ).to(device)
+
+    if ssl_init_blob is not None:
+        print_section("SSL Init")
+        ssl_report = _load_ssl_pretrain_init_into_stage1(model, ssl_init_blob)
+        print_kv_rows(
+            [
+                ("checkpoint", str(ssl_init_ckpt) if ssl_init_ckpt else "None"),
+                ("pretrain_mode", ssl_report.get("pretrain_mode", "unknown")),
+                ("ssl_upscale_type", ssl_report.get("ssl_upscale_type", "")),
+                ("stage1_dino_upsampler", cfg.dino_upsampler_type),
+                ("lora_modules_wrapped", ssl_report.get("lora_modules_wrapped", 0)),
+                ("lora_tensors_loaded", ssl_report.get("lora_tensors_loaded", 0)),
+                ("lora_params_loaded", ssl_report.get("lora_params_loaded", 0)),
+                ("backbone_missing", ssl_report.get("backbone_missing", 0)),
+                ("backbone_unexpected", ssl_report.get("backbone_unexpected", 0)),
+                ("adapter_loaded", ssl_report.get("adapter_loaded", 0)),
+                ("adapter_up_tensors_loaded", ssl_report.get("adapter_up_tensors_loaded", 0)),
+                ("adapter_up_tensors_interpolated", ssl_report.get("adapter_up_tensors_interpolated", 0)),
+                ("adapter_up_params_interpolated", ssl_report.get("adapter_up_params_interpolated", 0)),
+                ("adapter_local_tensors_loaded", ssl_report.get("adapter_local_tensors_loaded", 0)),
+                ("adapter_local_params_loaded", ssl_report.get("adapter_local_params_loaded", 0)),
+                ("adapter_params_loaded", ssl_report.get("adapter_params_loaded", 0)),
+                ("adapter_up_skipped_shape", ssl_report.get("adapter_up_skipped_shape", 0)),
+                ("adapter_local_skipped_shape", ssl_report.get("adapter_local_skipped_shape", 0)),
+                ("adapter_up_unmatched", ssl_report.get("adapter_up_unmatched", 0)),
+                ("adapter_local_unmatched", ssl_report.get("adapter_local_unmatched", 0)),
+                ("adapter_skipped_shape", ssl_report.get("adapter_skipped_shape", 0)),
+                ("adapter_unmatched", ssl_report.get("adapter_unmatched", 0)),
+            ]
+        )
+        if int(ssl_report.get("adapter_up_tensors_loaded", 0)) == 0 and str(ssl_report.get("pretrain_mode", "")) in {
+            "upscaling",
+            "lora_upscaling",
+        }:
+            print(
+                "  adapter_up_note     : no upsampler tensors loaded. "
+                "Most likely upsampler-type mismatch between SSL checkpoint and stage1 "
+                f"(ssl_upscale_type={ssl_report.get('ssl_upscale_type', '')}, "
+                f"stage1_dino_upsampler={cfg.dino_upsampler_type})."
+            )
+        if "adapter_note" in ssl_report:
+            print(f"  adapter_note        : {ssl_report['adapter_note']}")
 
     # Always keep DINO backbone frozen.
     set_module_requires_grad(model.dino, False)
