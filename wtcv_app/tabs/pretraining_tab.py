@@ -16,6 +16,8 @@ def run_pretraining(
     epochs: int,
     batch_size: int,
     num_workers: int,
+    tile_size: int,
+    tile_stride: int,
     image_size: int,
     local_crop_size: int,
     num_local_crops: int,
@@ -74,6 +76,10 @@ def run_pretraining(
         str(int(batch_size)),
         "--num-workers",
         str(int(num_workers)),
+        "--tile-size",
+        str(int(tile_size)),
+        "--tile-stride",
+        str(int(tile_stride)),
         "--image-size",
         str(int(image_size)),
         "--local-crop-size",
@@ -183,6 +189,8 @@ def build_tab(root: Path, nested: bool = False) -> None:
             epochs = gr.Number(value=10, precision=0, label="Epochs")
             batch_size = gr.Number(value=16, precision=0, label="Batch Size")
             num_workers = gr.Number(value=8, precision=0, label="Num Workers")
+            tile_size = gr.Number(value=0, precision=0, label="Pretrain Tile Size", info="0 disables tiling. >0 builds tile dataset before SSL cropping.")
+            tile_stride = gr.Number(value=0, precision=0, label="Pretrain Tile Stride", info="0 uses tile size as stride.")
             seed = gr.Number(value=42, precision=0, label="Seed")
             save_every = gr.Number(value=1, precision=0, label="Save Every (epochs)")
             debug_pca_every_steps = gr.Number(value=0, precision=0, label="Debug PCA Every N Steps (0=off)")
@@ -300,6 +308,8 @@ def build_tab(root: Path, nested: bool = False) -> None:
                 epochs,
                 batch_size,
                 num_workers,
+                tile_size,
+                tile_stride,
                 image_size,
                 local_crop_size,
                 num_local_crops,

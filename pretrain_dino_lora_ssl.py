@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 from sklearn.cluster import KMeans
 from backbones_adapters import DinoLearnedUpsampler, DinoPixelShuffleUpsampler
 from backbones_adapters import ResNetLocalBranch
+from wtcv_utils.tiling import crop_with_pad, tile_origins
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--tile-size", type=int, default=0, help="Optional pretraining tile size (0 disables tiling).")
+    ap.add_argument("--tile-stride", type=int, default=0, help="Optional pretraining tile stride (0 => tile_size).")
     ap.add_argument("--image-size", type=int, default=224)
     ap.add_argument("--local-crop-size", type=int, default=96)
     ap.add_argument("--num-local-crops", type=int, default=4)
@@ -106,6 +109,39 @@ class ImageFolderRecursive(Dataset):
         p = self.paths[idx]
         img = Image.open(p).convert("RGB")
         return img
+
+
+class TiledImageFolderRecursive(Dataset):
+    def __init__(self, roots: Sequence[Path], tile_size: int, tile_stride: int):
+        self.roots = [Path(r) for r in roots]
+        self.tile_size = int(tile_size)
+        self.tile_stride = int(tile_stride) if int(tile_stride) > 0 else int(tile_size)
+        if self.tile_size <= 0:
+            raise ValueError("tile_size must be > 0 for tiled dataset")
+        if self.tile_stride <= 0:
+            raise ValueError("tile_stride must be > 0 for tiled dataset")
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        self.paths: List[Path] = []
+        for root in self.roots:
+            self.paths.extend([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+        self.samples: List[Tuple[Path, int, int]] = []
+        for p in self.paths:
+            try:
+                with Image.open(p) as im:
+                    w, h = im.size
+            except Exception:
+                continue
+            for x0, y0 in tile_origins(w, h, self.tile_size, self.tile_stride):
+                self.samples.append((p, int(x0), int(y0)))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Image.Image:
+        p, x0, y0 = self.samples[idx]
+        img = Image.open(p).convert("RGB")
+        tile = crop_with_pad(img, int(x0), int(y0), int(self.tile_size))
+        return tile
 
 
 class MultiCropAug:
@@ -237,11 +273,22 @@ class Stage1UpscaleTokenAdapter(nn.Module):
         gh = max(1, h // int(patch_size))
         gw = max(1, w // int(patch_size))
         if gh * gw != int(n):
-            gh = int(round(float(np.sqrt(int(n)))))
-            gh = max(1, gh)
-            gw = max(1, int(n // gh))
-            if gh * gw != int(n):
-                raise RuntimeError(f"Cannot reshape tokens N={n} to grid")
+            # Fallback: infer a valid factor pair closest to image aspect ratio.
+            target_ar = float(w) / float(max(1, h))
+            best: Tuple[float, int, int] | None = None
+            nn = int(n)
+            for d in range(1, int(math.sqrt(float(nn))) + 1):
+                if (nn % d) != 0:
+                    continue
+                a, b2 = int(d), int(nn // d)
+                for hh, ww in ((a, b2), (b2, a)):
+                    ar = float(ww) / float(max(1, hh))
+                    score = abs(ar - target_ar)
+                    if best is None or score < best[0]:
+                        best = (score, hh, ww)
+            if best is None:
+                raise RuntimeError(f"Cannot factor token count N={n} into grid")
+            gh, gw = int(best[1]), int(best[2])
         fmap = tokens.transpose(1, 2).reshape(b, c, gh, gw).contiguous()
         return fmap, gh, gw
 
@@ -679,7 +726,15 @@ def main() -> None:
     if missing:
         raise FileNotFoundError(f"Missing input directories: {missing}")
 
-    ds = ImageFolderRecursive(input_dirs)
+    use_tiling = int(args.tile_size) > 0
+    if use_tiling:
+        ds = TiledImageFolderRecursive(
+            input_dirs,
+            tile_size=int(args.tile_size),
+            tile_stride=(int(args.tile_stride) if int(args.tile_stride) > 0 else int(args.tile_size)),
+        )
+    else:
+        ds = ImageFolderRecursive(input_dirs)
     if len(ds) == 0:
         raise RuntimeError(f"No images found in input directories: {[str(p) for p in input_dirs]}")
 
@@ -691,11 +746,19 @@ def main() -> None:
     cfg["dataset_size"] = len(ds)
     cfg["device"] = str(device)
     cfg["input_dirs_resolved"] = [str(p) for p in input_dirs]
+    cfg["tiling_enabled"] = bool(use_tiling)
+    cfg["tile_size_effective"] = int(args.tile_size) if use_tiling else 0
+    cfg["tile_stride_effective"] = (int(args.tile_stride) if int(args.tile_stride) > 0 else int(args.tile_size)) if use_tiling else 0
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
     print(f"device={device}")
     print(f"input_dirs={[str(p) for p in input_dirs]}")
-    print(f"dataset_images={len(ds)}")
+    if use_tiling:
+        n_images = len(getattr(ds, "paths", []))
+        print(f"dataset_images={n_images}")
+        print(f"dataset_tiles={len(ds)} tile_size={cfg['tile_size_effective']} tile_stride={cfg['tile_stride_effective']}")
+    else:
+        print(f"dataset_images={len(ds)}")
     print(f"run_dir={run_dir}")
 
     student_backbone = torch.hub.load("facebookresearch/dinov2", str(args.dino_model), trust_repo=bool(args.trust_torch_hub_repo)).to(device)
